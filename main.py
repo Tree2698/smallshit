@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import importlib
 
 from tkinterdnd2 import TkinterDnD
 
@@ -9,15 +8,19 @@ from ui_shell import DEFAULT_PREFERENCES, MODE_LABELS, load_app_preferences
 
 
 APP_OPTIONS = {
-    "horizontal": ("横版", "app_horizontal", "HorizontalApp"),
-    "vertical": ("竖版", "app_vertical", "VerticalApp"),
+    "horizontal": "横版",
+    "vertical": "竖版",
 }
 
 
 def load_app_class(mode: str):
-    _, module_name, class_name = APP_OPTIONS[mode]
-    module = importlib.import_module(module_name)
-    return getattr(module, class_name)
+    if mode == "horizontal":
+        from app_horizontal import HorizontalApp
+        return HorizontalApp
+    if mode == "vertical":
+        from app_vertical import VerticalApp
+        return VerticalApp
+    raise ValueError(f"未知模式: {mode}")
 
 
 def resolve_mode(cli_mode: str | None) -> str:

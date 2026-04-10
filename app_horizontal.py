@@ -37,6 +37,7 @@ from ui_shell import (
     open_output_folder,
     populate_recent_menus,
     set_status,
+    show_workbook_preview,
 )
 
 # 当前程序版本号——每次发布时请手动更新
@@ -318,6 +319,7 @@ class HorizontalApp:
             "filter_conditions": self.filter_conditions,
             "group_templates": self.group_templates,
             "active_group_template_name": self.active_group_template_name,
+            "last_output_path": self.last_output_path,
         }
         cfg_path = path or CONFIG_FILE
         try:
@@ -367,6 +369,7 @@ class HorizontalApp:
             self.filter_conditions = cfg.get("filter_conditions", [])
             self.group_templates = cfg.get("group_templates", {})
             self.active_group_template_name = cfg.get("active_group_template_name", "")
+            self.last_output_path = cfg.get("last_output_path")
 
         except Exception as e:
             messagebox.showerror("加载失败", str(e))
@@ -1193,15 +1196,21 @@ class HorizontalApp:
         return df
 
     def _write_export_overview(self, writer, output_path, overview_rows):
+        active_filters = [c for c in self.filter_conditions if c.get("enabled", True)]
+        filtered_rows = len(self.get_active_data()) if hasattr(self, "get_active_data") else len(self.data)
         summary_rows = [
             {"项目": "导出时间", "内容": time.strftime("%Y-%m-%d %H:%M:%S")},
             {"项目": "模式", "内容": self.mode_label},
             {"项目": "源文件", "内容": self.excel_path},
             {"项目": "数据源", "内容": self.current_sheet_name or "当前数据"},
+            {"项目": "原始记录数", "内容": len(self.data)},
+            {"项目": "导出记录数", "内容": filtered_rows},
             {"项目": "导出文件", "内容": output_path},
             {"项目": "统计量", "内容": "、".join(self.last_stats)},
             {"项目": "插入小计行", "内容": "是" if self.subtotal_var.get() else "否"},
             {"项目": "面积统计", "内容": "是" if self.area_cb.get() else "否"},
+            {"项目": "筛选条件", "内容": describe_filter_conditions(active_filters)},
+            {"项目": "当前模板", "内容": self.active_group_template_name or "未使用"},
             {"项目": "批量值字段", "内容": "、".join(self.batch_fields) if self.batch_fields else "未启用"},
             {"项目": "批量分组字段", "内容": "、".join(self.group_batch_fields) if self.group_batch_fields else "未启用"},
         ]
@@ -1317,6 +1326,7 @@ class HorizontalApp:
             self.ratio_var.set(cols[-1])
         self._refresh_levels(cols)
         self._restore_ui_state(cols)
+        self._normalize_filter_conditions(cols)
 
         if ext == ".csv":
             self.sheet_menu.set("")
@@ -1328,7 +1338,7 @@ class HorizontalApp:
 
         self.toggle_area_fields()
         self.calculate_btn.state(["!disabled"])
-        set_status(self, f"已加载 {len(df)} 行 / {len(cols)} 列")
+        self._update_loaded_status()
 
     def _refresh_levels(self, cols):
         for lvl in self.levels:
@@ -1449,6 +1459,13 @@ class HorizontalApp:
             messagebox.showerror("错误", "请先加载数据")
             return self._hide_progress("就绪")
 
+        active_df = self._get_filtered_data(show_error=True)
+        if active_df is None:
+            return self._hide_progress("就绪")
+        if active_df.empty:
+            messagebox.showwarning("提示", "筛选后没有可用数据，请调整条件后再试。")
+            return self._hide_progress("就绪")
+
         # 默认分类级别
         gf = [l["var"].get() for l in self.levels if l["var"].get()]
         if self.batch_var.get() and getattr(self, "batch_fields", None):
@@ -1523,7 +1540,7 @@ class HorizontalApp:
             for field, gf_current in loops:
                 self.status_var.set(f"计算: 值字段={field}, 分组={gf_current}")
 
-                df0 = self.data.copy()
+                df0 = active_df.copy()
                 df0[field] = pd.to_numeric(df0[field], errors="coerce")
                 valid_count = int(df0[field].count())
                 if valid_count == 0:
@@ -1791,6 +1808,7 @@ class HorizontalApp:
         self.status_var.set("彩蛋完成")
     def show_result_dialog(self, filepath, elapsed):
         mark_output(self, filepath)
+        self.save_config(show_msg=False)
         dlg = tk.Toplevel(self.root)
         dlg.title("完成")
         dlg.geometry("620x190")
@@ -1826,50 +1844,4 @@ class HorizontalApp:
             messagebox.showerror("打开失败", str(e))
 
     def open_preview(self, filepath):
-        try:
-            xls = pd.read_excel(filepath, sheet_name=None)
-        except Exception as e:
-            return messagebox.showerror("预览失败", str(e))
-
-        dlg = tk.Toplevel(self.root)
-        dlg.title("预览结果")
-        dlg.geometry("800x500")
-
-        # 选择子表
-        sheets = list(xls.keys())
-        var = tk.StringVar(value=sheets[0])
-        cmb = ttk.Combobox(dlg, values=sheets, textvariable=var, state="readonly")
-        cmb.pack(fill='x', padx=12, pady=(12,6))
-
-        # Treeview 显示区域
-        container = ttk.Frame(dlg)
-        container.pack(fill='both', expand=True, padx=12, pady=(0,12))
-        tv = ttk.Treeview(container, show="headings")
-
-
-
-        vsb = ttk.Scrollbar(container, orient="vertical", command=tv.yview)
-        hsb = ttk.Scrollbar(container, orient="horizontal", command=tv.xview)
-        tv.configure(yscroll=vsb.set, xscroll=hsb.set)
-        tv.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-        container.rowconfigure(0, weight=1)
-        container.columnconfigure(0, weight=1)
-
-        def load_sheet(e=None):
-            df = xls[var.get()]
-            tv.delete(*tv.get_children())
-            tv["columns"] = list(df.columns)
-            for col in df.columns:
-                tv.heading(col, text=col)
-                tv.column(col, width=100, anchor="center")
-
-            preview_df = df.head(300)
-            for row in preview_df.itertuples(index=False):
-                tv.insert("", "end", values=row)
-
-        cmb.bind("<<ComboboxSelected>>", load_sheet)
-        load_sheet()
-
-        dlg.grab_set()
+        show_workbook_preview(self.root, filepath, title="预览结果", default_limit=300)

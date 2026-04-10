@@ -1,17 +1,14 @@
 __pycache__/
-*.py[cod]
-*.log
+*.pyc
+*.pyo
+*.pyd
 
-# Runtime config
-small_shit.json
-small_shit_vertical.json
-app_preferences.json
-
-# Exported result files
-*_结果.xlsx
-*_计算小捞翔后.xlsx
-
-# Packaging output
 build/
 dist/
-*.spec
+*.egg-info/
+
+small_shit.json
+small_shit_vertical.json
+
+*.xlsx
+*.xls

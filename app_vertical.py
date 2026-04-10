@@ -40,6 +40,7 @@ from ui_shell import (
     open_output_folder,
     populate_recent_menus,
     set_status,
+    show_workbook_preview,
 )
 
 # 当前程序版本号——每次发布时请手动更新
@@ -111,6 +112,7 @@ class VerticalApp:
         # 载入上次保存的配置
         self.load_config()
         self.create_recent_menu()
+        self.toggle_area_fields()
         bind_shortcuts(self)
         # 检查更新
         self.check_for_update()
@@ -120,6 +122,434 @@ class VerticalApp:
         # 退出前保存配置
         self.save_config(show_msg=False)
         self.root.destroy()
+
+    def _normalize_filter_conditions(self, cols):
+        normalized = []
+        for condition in getattr(self, "filter_conditions", []):
+            if not isinstance(condition, dict):
+                continue
+            field = str(condition.get("field", "")).strip()
+            op = str(condition.get("op", "")).strip()
+            if field and op and field in cols:
+                normalized.append(
+                    {
+                        "field": field,
+                        "op": op,
+                        "value": str(condition.get("value", "")),
+                        "enabled": bool(condition.get("enabled", True)),
+                    }
+                )
+        self.filter_conditions = normalized
+
+    def _filter_summary(self):
+        active_conditions = [c for c in self.filter_conditions if c.get("enabled", True)]
+        return describe_filter_conditions(active_conditions)
+
+    def _get_filtered_data(self, show_error=True):
+        if self.data.empty:
+            return self.data.copy()
+
+        try:
+            return apply_filter_conditions(self.data, self.filter_conditions)
+        except Exception as exc:
+            if show_error:
+                messagebox.showerror("筛选条件有误", str(exc))
+                set_status(self, "筛选条件有误，请检查后再试")
+            return None
+
+    def get_active_data(self):
+        filtered = self._get_filtered_data(show_error=False)
+        if isinstance(filtered, pd.DataFrame):
+            return filtered
+        return self.data
+
+    def _update_loaded_status(self):
+        if self.data.empty:
+            set_status(self, f"{self.mode_label} 就绪")
+            return
+
+        total_rows = len(self.data)
+        total_cols = len(self.data.columns)
+        if not self.filter_conditions:
+            set_status(self, f"已加载 {total_rows} 行 / {total_cols} 列")
+            return
+
+        filtered = self._get_filtered_data(show_error=False)
+        if filtered is None:
+            set_status(self, f"已加载 {total_rows} 行 / {total_cols} 列，筛选条件待修正")
+            return
+
+        set_status(self, f"已加载 {total_rows} 行 / {total_cols} 列，筛选后 {len(filtered)} 行")
+
+    def _collect_group_template(self):
+        return {
+            "ui_state": self._collect_ui_state(),
+            "stats": list(self.last_stats),
+        }
+
+    def _describe_group_template(self, name, payload):
+        state = payload.get("ui_state", {}) if isinstance(payload, dict) else {}
+        stats = payload.get("stats", []) if isinstance(payload, dict) else []
+        lines = [
+            f"模板名称：{name}",
+            f"分类级别：{' / '.join(state.get('levels', [])) or '未设置'}",
+            f"值字段：{state.get('value_field') or '未设置'}",
+            f"面积字段：{state.get('ratio_field') or '未设置'}",
+            f"面积统计：{'是' if state.get('area_enabled', False) else '否'}",
+            f"批量值字段：{' / '.join(state.get('batch_fields', [])) or '未启用'}",
+            f"批量分组字段：{' / '.join(state.get('group_batch_fields', [])) or '未启用'}",
+            f"统计量：{' / '.join(stats) if stats else '未设置'}",
+        ]
+        return "\n".join(lines)
+
+    def _apply_group_template(self, payload, template_name=""):
+        if self.data.empty:
+            messagebox.showwarning("提示", "请先加载数据后再应用模板")
+            return False
+
+        if not isinstance(payload, dict):
+            messagebox.showerror("错误", "模板内容无效")
+            return False
+
+        state = payload.get("ui_state", {})
+        if not isinstance(state, dict):
+            messagebox.showerror("错误", "模板缺少界面配置")
+            return False
+
+        cols = list(self.data.columns)
+        enabled_fields = list(state.get("levels", []))
+        if state.get("value_field"):
+            enabled_fields.append(state.get("value_field"))
+        if state.get("area_enabled", False) and state.get("ratio_field"):
+            enabled_fields.append(state.get("ratio_field"))
+        if state.get("batch_enabled", False):
+            enabled_fields.extend(state.get("batch_fields", []))
+        if state.get("group_batch_enabled", False):
+            enabled_fields.extend(state.get("group_batch_fields", []))
+
+        missing_fields = sorted({field for field in enabled_fields if field and field not in cols})
+        if missing_fields:
+            messagebox.showwarning("模板无法应用", "当前数据缺少以下字段：\n" + "\n".join(missing_fields))
+            return False
+
+        self.saved_ui_state = state
+        self._restore_ui_state(cols)
+        stats = [stat for stat in payload.get("stats", []) if stat in self.all_stats]
+        if stats:
+            self.last_stats = stats
+        self.active_group_template_name = template_name
+        self._update_loaded_status()
+        return True
+
+    def open_group_template_manager(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("分组模板")
+        dialog.geometry("720x420")
+        dialog.transient(self.root)
+
+        container = ttk.Frame(dialog, padding=12)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(1, weight=1)
+        container.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(container)
+        left.grid(row=0, column=0, sticky="ns", padx=(0, 12))
+        right = ttk.Frame(container)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.rowconfigure(1, weight=1)
+
+        ttk.Label(left, text="已保存模板").pack(anchor="w")
+        listbox = tk.Listbox(left, width=24, height=16)
+        listbox.pack(fill="y", expand=True, pady=(6, 8))
+
+        ttk.Label(right, text="模板内容").grid(row=0, column=0, sticky="w")
+        preview = tk.Text(right, wrap="word", state="disabled", height=16)
+        preview.grid(row=1, column=0, sticky="nsew", pady=(6, 8))
+
+        buttons = ttk.Frame(right)
+        buttons.grid(row=2, column=0, sticky="e")
+
+        def selected_name():
+            selection = listbox.curselection()
+            if not selection:
+                return ""
+            return listbox.get(selection[0])
+
+        def refresh_templates(target_name=""):
+            names = sorted(self.group_templates)
+            listbox.delete(0, "end")
+            for name in names:
+                listbox.insert("end", name)
+
+            if target_name and target_name in names:
+                index = names.index(target_name)
+                listbox.selection_set(index)
+                listbox.see(index)
+            elif names:
+                listbox.selection_set(0)
+
+            update_preview()
+
+        def update_preview(_event=None):
+            name = selected_name()
+            content = "暂无模板"
+            if name:
+                content = self._describe_group_template(name, self.group_templates.get(name, {}))
+            preview.configure(state="normal")
+            preview.delete("1.0", "end")
+            preview.insert("1.0", content)
+            preview.configure(state="disabled")
+
+        def save_current_template():
+            if self.data.empty:
+                messagebox.showwarning("提示", "请先加载数据后再保存模板")
+                return
+
+            initial_name = self.active_group_template_name or selected_name() or "常用模板"
+            name = simpledialog.askstring("保存模板", "请输入模板名称：", parent=dialog, initialvalue=initial_name)
+            if not name:
+                return
+            name = name.strip()
+            if not name:
+                return
+
+            self.group_templates[name] = self._collect_group_template()
+            self.active_group_template_name = name
+            self.save_config(show_msg=False)
+            refresh_templates(name)
+            set_status(self, f"模板“{name}”已保存")
+
+        def apply_selected_template():
+            name = selected_name()
+            if not name:
+                messagebox.showinfo("提示", "请先选择一个模板")
+                return
+            if self._apply_group_template(self.group_templates.get(name, {}), name):
+                self.save_config(show_msg=False)
+                dialog.destroy()
+
+        def delete_selected_template():
+            name = selected_name()
+            if not name:
+                return
+            if not messagebox.askyesno("确认删除", f"确定要删除模板“{name}”吗？", parent=dialog):
+                return
+            self.group_templates.pop(name, None)
+            if self.active_group_template_name == name:
+                self.active_group_template_name = ""
+            self.save_config(show_msg=False)
+            refresh_templates()
+
+        def export_selected_template():
+            name = selected_name()
+            if not name:
+                messagebox.showinfo("提示", "请先选择一个模板")
+                return
+            path = filedialog.asksaveasfilename(
+                title="导出模板",
+                defaultextension=".json",
+                filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+                initialfile=f"{name}.json",
+            )
+            if not path:
+                return
+            with open(path, "w", encoding="utf-8") as file:
+                json.dump({"name": name, "template": self.group_templates[name]}, file, ensure_ascii=False, indent=2)
+            set_status(self, f"模板已导出到 {os.path.basename(path)}")
+
+        def import_template():
+            path = filedialog.askopenfilename(
+                title="导入模板",
+                filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+            )
+            if not path:
+                return
+
+            with open(path, "r", encoding="utf-8") as file:
+                payload = json.load(file)
+
+            if isinstance(payload, dict) and "template" in payload:
+                name = str(payload.get("name") or os.path.splitext(os.path.basename(path))[0]).strip()
+                template = payload.get("template", {})
+            else:
+                name = os.path.splitext(os.path.basename(path))[0]
+                template = payload
+
+            if not name or not isinstance(template, dict):
+                messagebox.showerror("导入失败", "模板文件格式不正确")
+                return
+
+            self.group_templates[name] = template
+            self.save_config(show_msg=False)
+            refresh_templates(name)
+            set_status(self, f"模板“{name}”已导入")
+
+        ttk.Button(buttons, text="保存当前", command=save_current_template).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="应用", command=apply_selected_template).pack(side="left", padx=6)
+        ttk.Button(buttons, text="删除", command=delete_selected_template).pack(side="left", padx=6)
+        ttk.Button(buttons, text="导出", command=export_selected_template).pack(side="left", padx=6)
+        ttk.Button(buttons, text="导入", command=import_template).pack(side="left", padx=6)
+        ttk.Button(buttons, text="关闭", command=dialog.destroy).pack(side="left", padx=(6, 0))
+
+        listbox.bind("<<ListboxSelect>>", update_preview)
+        refresh_templates(self.active_group_template_name)
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+
+    def open_filter_builder(self):
+        if self.data.empty:
+            messagebox.showwarning("提示", "请先加载数据后再设置筛选条件")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("条件筛选")
+        dialog.geometry("760x420")
+        dialog.transient(self.root)
+
+        container = ttk.Frame(dialog, padding=12)
+        container.pack(fill="both", expand=True)
+        container.rowconfigure(1, weight=1)
+        container.columnconfigure(0, weight=1)
+
+        ttk.Label(container, text=f"当前数据共 {len(self.data)} 行，可添加多个筛选条件。").grid(row=0, column=0, sticky="w")
+
+        rows_frame = ttk.Frame(container)
+        rows_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 8))
+        rows_frame.columnconfigure(0, weight=1)
+
+        summary_var = tk.StringVar()
+        detail_var = tk.StringVar(value=self._filter_summary())
+        condition_rows = []
+        cols = list(self.data.columns)
+
+        def collect_conditions():
+            conditions = []
+            for item in condition_rows:
+                field = item["field"].get().strip()
+                op = item["op"].get().strip()
+                value = item["value"].get().strip()
+                enabled = bool(item["enabled"].get())
+                if field and op:
+                    conditions.append(
+                        {
+                            "field": field,
+                            "op": op,
+                            "value": value,
+                            "enabled": enabled,
+                        }
+                    )
+            return conditions
+
+        def refresh_summary():
+            conditions = collect_conditions()
+            active_conditions = [c for c in conditions if c.get("enabled", True)]
+            detail_var.set(describe_filter_conditions(active_conditions))
+            try:
+                filtered = apply_filter_conditions(self.data, conditions)
+            except Exception as exc:
+                summary_var.set(f"条件有误：{exc}")
+                return
+
+            if active_conditions:
+                summary_var.set(f"已启用 {len(active_conditions)} 条，筛选后 {len(filtered)} / {len(self.data)} 行")
+            else:
+                summary_var.set(f"当前未启用筛选，将使用全部 {len(self.data)} 行数据")
+
+        def remove_condition(item):
+            item["frame"].destroy()
+            if item in condition_rows:
+                condition_rows.remove(item)
+            if not condition_rows:
+                add_condition_row()
+            refresh_summary()
+
+        def add_condition_row(condition=None):
+            condition = condition or {}
+            frame = ttk.Frame(rows_frame)
+            frame.pack(fill="x", pady=4)
+
+            enabled_var = tk.BooleanVar(value=bool(condition.get("enabled", True)))
+            field_var = tk.StringVar(value=str(condition.get("field", cols[0] if cols else "")))
+            op_var = tk.StringVar(value=str(condition.get("op", FILTER_OPERATORS[0])))
+            value_var = tk.StringVar(value=str(condition.get("value", "")))
+
+            ttk.Checkbutton(frame, text="启用", variable=enabled_var, command=refresh_summary).pack(side="left")
+            field_box = ttk.Combobox(frame, values=cols, textvariable=field_var, state="readonly", width=20)
+            field_box.pack(side="left", padx=(8, 6))
+            op_box = ttk.Combobox(frame, values=FILTER_OPERATORS, textvariable=op_var, state="readonly", width=12)
+            op_box.pack(side="left", padx=6)
+            value_entry = ttk.Entry(frame, textvariable=value_var, width=22)
+            value_entry.pack(side="left", padx=6)
+
+            item = {
+                "frame": frame,
+                "enabled": enabled_var,
+                "field": field_var,
+                "op": op_var,
+                "value": value_var,
+            }
+
+            def sync_value_state(*_args):
+                disabled = op_var.get() in {"为空", "不为空"}
+                value_entry.configure(state="disabled" if disabled else "normal")
+                if disabled:
+                    value_var.set("")
+                refresh_summary()
+
+            op_var.trace_add("write", sync_value_state)
+            field_box.bind("<<ComboboxSelected>>", lambda _event: refresh_summary())
+            value_entry.bind("<KeyRelease>", lambda _event: refresh_summary())
+            ttk.Button(frame, text="删除", command=lambda: remove_condition(item)).pack(side="left", padx=(6, 0))
+            condition_rows.append(item)
+            sync_value_state()
+
+        controls = ttk.Frame(container)
+        controls.grid(row=2, column=0, sticky="ew")
+        ttk.Button(controls, text="新增条件", command=add_condition_row).pack(side="left")
+        ttk.Button(
+            controls,
+            text="清空筛选",
+            command=lambda: (
+                [row["frame"].destroy() for row in condition_rows],
+                condition_rows.clear(),
+                self.filter_conditions.clear(),
+                add_condition_row(),
+                refresh_summary(),
+            ),
+        ).pack(side="left", padx=6)
+
+        ttk.Label(container, textvariable=summary_var).grid(row=3, column=0, sticky="w", pady=(10, 2))
+        ttk.Label(container, textvariable=detail_var, wraplength=700).grid(row=4, column=0, sticky="w")
+
+        buttons = ttk.Frame(container)
+        buttons.grid(row=5, column=0, sticky="e", pady=(12, 0))
+
+        def apply_conditions():
+            conditions = collect_conditions()
+            try:
+                filtered = apply_filter_conditions(self.data, conditions)
+            except Exception as exc:
+                messagebox.showerror("筛选条件有误", str(exc), parent=dialog)
+                return
+
+            self.filter_conditions = [c for c in conditions if c.get("enabled", True)]
+            self._update_loaded_status()
+            self.save_config(show_msg=False)
+            if self.filter_conditions:
+                set_status(self, f"筛选已更新，当前保留 {len(filtered)} 行")
+            else:
+                set_status(self, f"已清除筛选，当前共 {len(self.data)} 行")
+            dialog.destroy()
+
+        ttk.Button(buttons, text="应用", command=apply_conditions).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="关闭", command=dialog.destroy).pack(side="left")
+
+        existing_conditions = self.filter_conditions or [{}]
+        for condition in existing_conditions:
+            add_condition_row(condition)
+        refresh_summary()
+        dialog.grab_set()
+        self.root.wait_window(dialog)
 
     def _collect_ui_state(self):
         return {
@@ -162,6 +592,7 @@ class VerticalApp:
             self.ratio_var.set(saved_ratio)
 
         self.area_cb.set(bool(state.get("area_enabled", self.area_cb.get())))
+        self.toggle_area_fields()
         if self.area_cb.get() and saved_ratio in cols:
             self.ratio_var.set(saved_ratio)
 
@@ -186,6 +617,7 @@ class VerticalApp:
             "filter_conditions": self.filter_conditions,
             "group_templates": self.group_templates,
             "active_group_template_name": self.active_group_template_name,
+            "last_output_path": self.last_output_path,
         }
         cfg_path = path or CONFIG_FILE
         try:
@@ -224,6 +656,7 @@ class VerticalApp:
             self.filter_conditions = cfg.get("filter_conditions", [])
             self.group_templates = cfg.get("group_templates", {})
             self.active_group_template_name = cfg.get("active_group_template_name", "")
+            self.last_output_path = cfg.get("last_output_path")
         # 配置载入后刷新最近打开菜单（如果已经创建）
             if hasattr(self, "create_recent_menu"):
                 self.create_recent_menu()
@@ -400,7 +833,7 @@ class VerticalApp:
         self.area_decimals_spin.grid(row=2, column=1, sticky="w")
         self.area_cb = tk.BooleanVar(value=False)
         ttk.Checkbutton(
-            frm, text="计算面积占比", variable=self.area_cb
+            frm, text="计算面积占比", variable=self.area_cb, command=self.toggle_area_fields
         ).grid(row=1, column=2, padx=5)
 
     def _build_batch_controls(self):
@@ -563,14 +996,20 @@ class VerticalApp:
         return df
 
     def _write_export_overview(self, writer, output_path, overview_rows):
+        active_filters = [c for c in self.filter_conditions if c.get("enabled", True)]
+        filtered_rows = len(self.get_active_data()) if hasattr(self, "get_active_data") else len(self.data)
         summary_rows = [
             {"项目": "导出时间", "内容": time.strftime("%Y-%m-%d %H:%M:%S")},
             {"项目": "模式", "内容": self.mode_label},
             {"项目": "源文件", "内容": self.excel_path},
             {"项目": "数据源", "内容": self.current_sheet_name or "当前数据"},
+            {"项目": "原始记录数", "内容": len(self.data)},
+            {"项目": "导出记录数", "内容": filtered_rows},
             {"项目": "导出文件", "内容": output_path},
             {"项目": "统计量", "内容": "、".join(self.last_stats)},
             {"项目": "面积统计", "内容": "是" if self.area_cb.get() else "否"},
+            {"项目": "筛选条件", "内容": describe_filter_conditions(active_filters)},
+            {"项目": "当前模板", "内容": self.active_group_template_name or "未使用"},
             {"项目": "批量值字段", "内容": "、".join(self.batch_fields) if self.batch_fields else "未启用"},
             {"项目": "批量分组字段", "内容": "、".join(self.group_batch_fields) if self.group_batch_fields else "未启用"},
         ]
@@ -694,8 +1133,10 @@ class VerticalApp:
             self.val_var.set(cols[-1])
             self.ratio_var.set(cols[-1])
         self._restore_ui_state(cols)
+        self._normalize_filter_conditions(cols)
         self.calculate_btn.state(["!disabled"])
-        self._hide_progress(f"已加载 {len(df)} 行 / {len(cols)} 列")
+        self._hide_progress()
+        self._update_loaded_status()
 
     def add_level(self):
         if len(self.levels) >= MAX_LEVELS:
@@ -836,6 +1277,14 @@ class VerticalApp:
         if self.data.empty:
             messagebox.showerror("错误", "请先选择并加载数据")
             return
+
+        active_df = self._get_filtered_data(show_error=True)
+        if active_df is None:
+            return
+        if active_df.empty:
+            messagebox.showwarning("提示", "筛选后没有可用数据，请调整条件后再试。")
+            return
+
         # 直接使用按钮预先设置好的统计量顺序
         stats = self.last_stats.copy()
         if not stats:
@@ -869,7 +1318,7 @@ class VerticalApp:
             all_fields.add(ratio)
 
         for f in all_fields:
-            if f not in self.data.columns:
+            if f not in active_df.columns:
                 messagebox.showerror("错误", f"列 '{f}' 不存在")
                 return
 
@@ -885,7 +1334,7 @@ class VerticalApp:
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
             for val in val_fields:
                 for group_fields in group_fields_list:
-                    df0 = self.data.copy()
+                    df0 = active_df.copy()
                     df0[val] = pd.to_numeric(df0[val], errors="coerce")
                     valid_count = int(df0[val].count())
                     if valid_count == 0:
@@ -1218,6 +1667,7 @@ class VerticalApp:
         self.root.wait_window(dlg)
     def show_result_dialog(self, filepath, elapsed):
         mark_output(self, filepath)
+        self.save_config(show_msg=False)
         dlg = tk.Toplevel(self.root)
         dlg.title("完成")
         dlg.geometry("620x190")
@@ -1253,45 +1703,4 @@ class VerticalApp:
             messagebox.showerror("打开失败", str(e))
 
     def open_preview(self, filepath):
-        try:
-            xls = pd.read_excel(filepath, sheet_name=None)
-        except Exception as e:
-            return messagebox.showerror("预览失败", str(e))
-
-        dlg = tk.Toplevel(self.root)
-        dlg.title("预览结果")
-        dlg.geometry("800x500")
-
-        sheets = list(xls.keys())
-        var = tk.StringVar(value=sheets[0])
-        cmb = ttk.Combobox(dlg, values=sheets, textvariable=var,
-                           state="readonly")
-        cmb.pack(fill="x", padx=12, pady=(12,6))
-
-        container = ttk.Frame(dlg)
-        container.pack(fill="both", expand=True, padx=12, pady=(0,12))
-        tv = ttk.Treeview(container, show="headings")
-        vsb = ttk.Scrollbar(container, orient="vertical", command=tv.yview)
-        hsb = ttk.Scrollbar(container, orient="horizontal", command=tv.xview)
-        tv.configure(yscroll=vsb.set, xscroll=hsb.set)
-        tv.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
-        hsb.grid(row=1, column=0, sticky="ew")
-        container.rowconfigure(0, weight=1)
-        container.columnconfigure(0, weight=1)
-
-        def load_sheet(e=None):
-            df = xls[var.get()]
-            tv.delete(*tv.get_children())
-            tv["columns"] = list(df.columns)
-            for col in df.columns:
-                tv.heading(col, text=col)
-                tv.column(col, width=100, anchor="center")
-
-            for row in df.itertuples(index=False):
-                tv.insert("", "end", values=row)
-
-        cmb.bind("<<ComboboxSelected>>", load_sheet)
-        load_sheet()
-
-        dlg.grab_set()
+        show_workbook_preview(self.root, filepath, title="预览结果", default_limit=300)

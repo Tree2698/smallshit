@@ -40,8 +40,20 @@ OUTPUT_LOCATION_LABELS = {
 OUTPUT_LOCATION_NAMES = {label: value for value, label in OUTPUT_LOCATION_LABELS.items()}
 
 
+def runtime_root() -> Path:
+    """返回运行时根目录。源码运行时为项目目录，打包后为 exe 所在目录。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return runtime_root()
+
+
+def main_entry_path() -> Path:
+    """返回源码入口文件路径。仅在未打包时使用。"""
+    return runtime_root() / "main.py"
+
+
 def _preferences_path() -> Path:
-    return Path(__file__).resolve().with_name(PREFERENCES_FILE)
+    return runtime_root() / PREFERENCES_FILE
 
 
 def load_app_preferences() -> dict[str, object]:
@@ -218,6 +230,79 @@ def open_last_output(app) -> None:
         messagebox.showinfo("提示", "还没有可打开的导出结果。", parent=app.root)
         return
     app.open_file(path)
+
+
+def show_workbook_preview(root: tk.Misc, filepath: str, *, title: str = "预览结果", default_limit: int = 300) -> None:
+    """以较轻量的方式预览 Excel 文件，避免一次性加载过多行造成卡顿。"""
+    try:
+        workbook = pd.ExcelFile(filepath)
+        sheets = list(workbook.sheet_names)
+    except Exception as exc:
+        messagebox.showerror("预览失败", str(exc), parent=root)
+        return
+
+    dialog = tk.Toplevel(root)
+    dialog.title(title)
+    dialog.geometry("960x620")
+    dialog.minsize(760, 460)
+    dialog.transient(root)
+
+    container = ttk.Frame(dialog, padding=12)
+    container.pack(fill="both", expand=True)
+
+    controls = ttk.Frame(container)
+    controls.pack(fill="x", pady=(0, 8))
+
+    sheet_var = tk.StringVar(value=sheets[0] if sheets else "")
+    limit_var = tk.StringVar(value=str(default_limit))
+    info_var = tk.StringVar(value="")
+
+    ttk.Label(controls, text="工作表").pack(side="left")
+    sheet_box = ttk.Combobox(controls, values=sheets, textvariable=sheet_var, state="readonly", width=28)
+    sheet_box.pack(side="left", padx=(6, 12))
+    ttk.Label(controls, text="预览行数").pack(side="left")
+    ttk.Combobox(
+        controls,
+        values=["100", "300", "500", "1000"],
+        textvariable=limit_var,
+        state="readonly",
+        width=8,
+    ).pack(side="left", padx=(6, 12))
+    ttk.Label(controls, textvariable=info_var).pack(side="right")
+
+    tree_frame = ttk.Frame(container)
+    tree_frame.pack(fill="both", expand=True)
+    tree = ttk.Treeview(tree_frame, show="headings")
+    vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+    hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview)
+    tree.configure(yscroll=vsb.set, xscroll=hsb.set)
+    tree.grid(row=0, column=0, sticky="nsew")
+    vsb.grid(row=0, column=1, sticky="ns")
+    hsb.grid(row=1, column=0, sticky="ew")
+    tree_frame.rowconfigure(0, weight=1)
+    tree_frame.columnconfigure(0, weight=1)
+
+    def load_sheet(_event=None) -> None:
+        try:
+            limit = int(limit_var.get())
+        except ValueError:
+            limit = default_limit
+            limit_var.set(str(default_limit))
+
+        frame = pd.read_excel(workbook, sheet_name=sheet_var.get())
+        preview_df = frame.head(limit)
+        tree.delete(*tree.get_children())
+        tree["columns"] = list(preview_df.columns)
+        for column in preview_df.columns:
+            tree.heading(column, text=column)
+            tree.column(column, width=120, anchor="center")
+        for row in preview_df.itertuples(index=False):
+            tree.insert("", "end", values=row)
+        info_var.set(f"已显示 {len(preview_df)} / {len(frame)} 行")
+
+    sheet_box.bind("<<ComboboxSelected>>", load_sheet)
+    load_sheet()
+    dialog.grab_set()
 
 
 def mark_output(app, filepath: str) -> None:
@@ -671,8 +756,10 @@ def restart_in_mode(app, mode: str) -> None:
     if hasattr(app, "save_config"):
         app.save_config(show_msg=False)
 
-    main_path = Path(__file__).resolve().with_name("main.py")
-    os.execl(sys.executable, sys.executable, str(main_path), "--mode", mode)
+    if getattr(sys, "frozen", False):
+        os.execl(sys.executable, sys.executable, "--mode", mode)
+    else:
+        os.execl(sys.executable, sys.executable, str(main_entry_path()), "--mode", mode)
 
 
 def build_command_actions(app) -> list[tuple[str, Callable[[], None]]]:
