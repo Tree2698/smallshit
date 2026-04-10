@@ -13,21 +13,39 @@ APP_OPTIONS = {
 }
 
 
-def choose_orientation(root: tk.Misc) -> str | None:
-    """使用模态对话框选择启动模式，避免重复创建 Tk 根窗口。"""
-    dialog = tk.Toplevel(root)
+def center_window(window: tk.Misc, width: int, height: int) -> None:
+    """让窗口尽量出现在屏幕中间。"""
+    window.update_idletasks()
+    screen_width = window.winfo_screenwidth()
+    screen_height = window.winfo_screenheight()
+    x = max((screen_width - width) // 2, 0)
+    y = max((screen_height - height) // 2, 0)
+    window.geometry(f"{width}x{height}+{x}+{y}")
+
+
+def choose_orientation() -> str | None:
+    """先弹出独立选择窗，再创建主程序窗口。"""
+    dialog = tk.Tk()
     dialog.title("选择应用模式")
-    dialog.geometry("260x140")
+    width, height = 280, 160
+    dialog.geometry(f"{width}x{height}")
     dialog.resizable(False, False)
-    dialog.transient(root)
-    dialog.grab_set()
+    center_window(dialog, width, height)
+    dialog.lift()
+    dialog.focus_force()
+
+    try:
+        dialog.attributes("-topmost", True)
+        dialog.after(400, lambda: dialog.attributes("-topmost", False))
+    except tk.TclError:
+        pass
 
     choice = tk.StringVar(value="horizontal")
     result = {"mode": None}
 
-    ttk.Label(dialog, text="请选择启动模式：").pack(pady=(14, 6))
+    ttk.Label(dialog, text="请选择启动模式：").pack(pady=(18, 8))
     for mode, (label, _, _) in APP_OPTIONS.items():
-        ttk.Radiobutton(dialog, text=label, variable=choice, value=mode).pack(anchor="w", padx=36, pady=2)
+        ttk.Radiobutton(dialog, text=label, variable=choice, value=mode).pack(anchor="w", padx=48, pady=2)
 
     def on_confirm() -> None:
         result["mode"] = choice.get()
@@ -37,11 +55,10 @@ def choose_orientation(root: tk.Misc) -> str | None:
         result["mode"] = None
         dialog.destroy()
 
-    ttk.Button(dialog, text="确定", command=on_confirm).pack(pady=12)
+    ttk.Button(dialog, text="确定", command=on_confirm).pack(pady=14)
     dialog.protocol("WM_DELETE_WINDOW", on_cancel)
-    root.wait_window(dialog)
+    dialog.mainloop()
     return result["mode"]
-
 
 
 def load_app_class(mode: str):
@@ -50,18 +67,14 @@ def load_app_class(mode: str):
     return getattr(module, class_name)
 
 
-
 def main() -> None:
-    root = TkinterDnD.Tk()
-    root.withdraw()
-
-    mode = choose_orientation(root)
+    print("程序已启动，请查看弹出的窗口并选择启动模式。")
+    mode = choose_orientation()
     if mode is None:
-        root.destroy()
         return
 
     app_class = load_app_class(mode)
-    root.deiconify()
+    root = TkinterDnD.Tk()
     app_class(root)
     root.mainloop()
 
