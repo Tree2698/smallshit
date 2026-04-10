@@ -11,23 +11,48 @@ import numpy as np
 import pandas as pd
 import tkinter as tk
 from openpyxl.styles import Alignment, Border, Side
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinterdnd2 import DND_FILES
 
-from common_utils import open_with_default_app, read_csv_safely, round2, sort_key
+from common_utils import (
+    EXTENDED_STATS,
+    FILTER_OPERATORS,
+    apply_filter_conditions,
+    apply_count_masks,
+    build_grouped_stats_frame,
+    calculate_series_stats,
+    describe_filter_conditions,
+    open_with_default_app,
+    read_csv_safely,
+    round2,
+    sort_key,
+)
+from ui_shell import (
+    begin_busy,
+    bind_shortcuts,
+    build_output_path,
+    build_app_menu,
+    copy_text,
+    end_busy,
+    initialize_shell,
+    mark_output,
+    maybe_restore_recent_file,
+    open_output_folder,
+    populate_recent_menus,
+    set_status,
+)
 
 # 当前程序版本号——每次发布时请手动更新
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.2.0"
 
 UPDATE_CONTENT = """
-小捞翔·至尊版 v1.0.8 更新日志：
-- 新增：竖版自定义统计量排序
-- 新增：竖版最近打开
-- 新增：竖版自定义排序
-- 新增：竖版快速打开文件
-- 新增：竖版浏览文件
-- 新增：竖版面积自定义小数位数
-- 修复：在选择横竖版时点击关闭，无法正常关闭
-- 修复：竖版删除被限制行
+小捞翔·至尊版 v1.2.0 更新日志：
+- 新增：扩展统计指标，支持缺失数、缺失率、四分位数、极差、方差、偏度、峰度等
+- 新增：自动生成“统计说明”和“导出清单”工作表，方便回看参数和输出内容
+- 新增：值字段会自动尝试转为数值，无法计算的组合会提示并自动跳过
+- 优化：横版和竖版统计口径统一，更多统计方法在两个界面保持一致
+- 优化：统计量选择面板扩大，容纳更多指标
+- 优化：取消批量选项后会自动清空对应字段，减少误操作
 """
 
 # 默认配置文件名（可自定义目录）
@@ -41,31 +66,37 @@ MAX_LEVELS = 3  # 最多三级分类
 class VerticalApp:
     def __init__(self, root):
         self.root = root
+        initialize_shell(self, mode_name="vertical", title="小捞翔")
         # -------- 新增：自定义排序状态 --------
         self.custom_orders = {}  # 用户自定义的每列排序列表
         self.original_orders = {}  # 首次记录每列原始唯一值顺序
         # -------- 新增 recent_files 存储 最近打开 列表 --------
         self.recent_files = []
-        root.title("小捞翔 PRO MAX PLUS")
-        root.geometry("500x560")  # 增加高度以适应新控件
-        root.resizable(False, False)
+        root.geometry("720x720")
+        root.minsize(620, 640)
+        root.resizable(True, True)
 
         # 在窗口关闭前保存配置
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
 
+        root.drop_target_register(DND_FILES)
+        root.dnd_bind("<<DragEnter>>", lambda e: root.configure(bg="#1f232a"))
+        root.dnd_bind("<<DragLeave>>", lambda e: root.configure(bg="SystemButtonFace"))
+        root.dnd_bind("<<Drop>>", self.handle_drop)
+
         # 初始化属性
         self.excel_path = ""
         self.data = pd.DataFrame()
-        self.batch_fields = []  # 批量值字段列表
-        self.group_batch_fields = []  # 批量分组字段列表
+        self.batch_fields = []
+        self.group_batch_fields = []
+        self.filter_conditions = []
+        self.group_templates = {}
+        self.active_group_template_name = ""
         self.update_history = []  # 更新历史记录
         self.shown_version = ""  # 已显示的版本
 
         # 保存上次选择的统计量，初始全选
-        self.all_stats = [
-            "数量", "平均值", "中位值", "最大值",
-            "最小值", "标准差", "变异系数", "数量占比"
-        ]
+        self.all_stats = EXTENDED_STATS.copy()
         self.last_stats = self.all_stats.copy()
 
         # 构建菜单栏
@@ -75,16 +106,72 @@ class VerticalApp:
         self._build_field_controls()
         self._build_batch_controls()  # 添加批量控制组件
         self._build_buttons()
+        self._build_status_bar()
 
         # 载入上次保存的配置
         self.load_config()
+        self.create_recent_menu()
+        bind_shortcuts(self)
         # 检查更新
         self.check_for_update()
+        maybe_restore_recent_file(self)
 
     def on_closing(self):
         # 退出前保存配置
         self.save_config(show_msg=False)
         self.root.destroy()
+
+    def _collect_ui_state(self):
+        return {
+            "levels": [lvl["var"].get() for lvl in self.levels if lvl["var"].get()],
+            "value_field": self.val_var.get(),
+            "ratio_field": self.ratio_var.get(),
+            "area_enabled": bool(self.area_cb.get()),
+            "batch_enabled": bool(self.batch_var.get()),
+            "batch_fields": list(self.batch_fields),
+            "group_batch_enabled": bool(self.group_batch_var.get()),
+            "group_batch_fields": list(self.group_batch_fields),
+        }
+
+    def _set_level_count(self, target_count):
+        target_count = max(1, min(MAX_LEVELS, target_count))
+        while len(self.levels) < target_count:
+            self.add_level()
+        while len(self.levels) > target_count:
+            self._remove_level(self.levels[-1]["btn"])
+
+    def _restore_ui_state(self, cols):
+        state = getattr(self, "saved_ui_state", {})
+        if not isinstance(state, dict):
+            return
+
+        saved_levels = [field for field in state.get("levels", []) if field in cols]
+        if saved_levels:
+            self._set_level_count(len(saved_levels))
+            for idx, lvl in enumerate(self.levels):
+                if idx < len(saved_levels):
+                    lvl["var"].set(saved_levels[idx])
+                elif cols:
+                    lvl["var"].set(cols[0])
+
+        saved_value = state.get("value_field")
+        saved_ratio = state.get("ratio_field")
+        if saved_value in cols:
+            self.val_var.set(saved_value)
+        if saved_ratio in cols:
+            self.ratio_var.set(saved_ratio)
+
+        self.area_cb.set(bool(state.get("area_enabled", self.area_cb.get())))
+        if self.area_cb.get() and saved_ratio in cols:
+            self.ratio_var.set(saved_ratio)
+
+        self.batch_var.set(bool(state.get("batch_enabled", False)))
+        self.toggle_batch()
+        self.batch_fields = [field for field in state.get("batch_fields", []) if field in cols]
+
+        self.group_batch_var.set(bool(state.get("group_batch_enabled", False)))
+        self.toggle_group_batch()
+        self.group_batch_fields = [field for field in state.get("group_batch_fields", []) if field in cols]
 
     def save_config(self, path=None, show_msg=True):
         """保存配置到JSON文件"""
@@ -94,7 +181,11 @@ class VerticalApp:
             "last_stats": self.last_stats,
             "recent_files": self.recent_files
             , "custom_orders": self.custom_orders,
-            "area_decimals": self.area_decimals_var.get()
+            "area_decimals": self.area_decimals_var.get(),
+            "ui_state": self._collect_ui_state(),
+            "filter_conditions": self.filter_conditions,
+            "group_templates": self.group_templates,
+            "active_group_template_name": self.active_group_template_name,
         }
         cfg_path = path or CONFIG_FILE
         try:
@@ -129,6 +220,10 @@ class VerticalApp:
             self.custom_orders = cfg.get("custom_orders", {})
             dec = cfg.get("area_decimals", 2)
             self.area_decimals_var.set(dec)
+            self.saved_ui_state = cfg.get("ui_state", {})
+            self.filter_conditions = cfg.get("filter_conditions", [])
+            self.group_templates = cfg.get("group_templates", {})
+            self.active_group_template_name = cfg.get("active_group_template_name", "")
         # 配置载入后刷新最近打开菜单（如果已经创建）
             if hasattr(self, "create_recent_menu"):
                 self.create_recent_menu()
@@ -142,7 +237,7 @@ class VerticalApp:
         if self.shown_version != APP_VERSION:
             dlg = tk.Toplevel(self.root)
             dlg.title(f"更新日志 v{APP_VERSION}")
-            dlg.geometry("400x300")
+            dlg.geometry("520x360")
             dlg.resizable(False, False)
 
             # — 文本区 —
@@ -181,7 +276,7 @@ class VerticalApp:
 
         dlg = tk.Toplevel(self.root)
         dlg.title("更新历史")
-        dlg.geometry("400x300")
+        dlg.geometry("520x360")
         dlg.resizable(False, False)
 
         frm = ttk.Frame(dlg, padding=8)
@@ -200,25 +295,11 @@ class VerticalApp:
         self.root.wait_window(dlg)
 
     def _build_menu(self):
-        menubar = tk.Menu(self.root)
-        # 添加关于菜单
-        menubar.add_command(label="关于", command=self.show_update_history)
-        # -------- 新增：最近打开 菜单 --------
-        self.recent_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="最近打开", menu=self.recent_menu)
-        self.create_recent_menu()
-        self.root.config(menu=menubar)
+        build_app_menu(self)
+
     def create_recent_menu(self):
         """刷新 最近打开 下拉列表"""
-        self.recent_menu.delete(0, "end")
-        for p in self.recent_files:
-            name = os.path.basename(p)
-            self.recent_menu.add_command(
-                label=name,
-                command=lambda _p=p: self.open_recent(_p)
-            )
-        if not self.recent_files:
-            self.recent_menu.add_command(label="— 无记录 —", state="disabled")
+        populate_recent_menus(self)
 
     def add_recent(self, path):
         """把 path 插入到 最近打开（去重 + 限长 20）"""
@@ -239,22 +320,7 @@ class VerticalApp:
             self.create_recent_menu()
             return
 
-        # 跟 select_file 一致的加载逻辑
-        self.excel_path = path
-        self.lbl_file.config(text=os.path.basename(path))
-        if path.lower().endswith(".csv"):
-            self.data = read_csv_safely(path)
-            self.sheet_menu["values"] = []
-            self.sheet_menu.state(["disabled"])
-            self._on_sheet_loaded(self.data, "CSV")
-        else:
-            sheets = pd.ExcelFile(path).sheet_names
-            self.sheet_menu["values"] = sheets
-            self.sheet_menu.state(["!disabled"])
-            self.sheet_var.set(sheets[0])
-            self.load_sheet(sheets[0])
-
-        self.add_recent(path)
+        self._load_path(path)
 
     def _build_file_sheet_selector(self):
         frm = ttk.Frame(self.root)
@@ -263,8 +329,13 @@ class VerticalApp:
         ttk.Button(frm, text="选择 Excel", command=self.select_file) \
             .grid(row=0, column=0, sticky="w")
 
+        self.recent_btn = ttk.Menubutton(frm, text="最近打开")
+        self.recent_menu = tk.Menu(self.recent_btn, tearoff=0)
+        self.recent_btn["menu"] = self.recent_menu
+        self.recent_btn.grid(row=0, column=1, padx=(8, 0), sticky="w")
+
         self.lbl_file = ttk.Label(frm, text="未选择文件")
-        self.lbl_file.grid(row=0, column=1, padx=8, sticky="w")
+        self.lbl_file.grid(row=0, column=2, padx=8, sticky="w")
 
         ttk.Label(frm, text="子表:") \
             .grid(row=1, column=0, pady=6, sticky="w")
@@ -274,7 +345,7 @@ class VerticalApp:
             frm, textvariable=self.sheet_var,
             state="readonly", width=28
         )
-        self.sheet_menu.grid(row=1, column=1, sticky="w")
+        self.sheet_menu.grid(row=1, column=2, sticky="w")
         self.sheet_menu.bind(
             "<<ComboboxSelected>>",
             lambda e: self.load_sheet(self.sheet_var.get())
@@ -376,6 +447,10 @@ class VerticalApp:
         stats_btn.pack(side="right", padx=5)
         sort_btn = ttk.Button(frm, text="自定义排序", command=self.open_custom_sort)
         sort_btn.pack(side="right", padx=5)
+        filter_btn = ttk.Button(frm, text="条件筛选", command=self.open_filter_builder)
+        filter_btn.pack(side="right", padx=5)
+        template_btn = ttk.Button(frm, text="分组模板", command=self.open_group_template_manager)
+        template_btn.pack(side="right", padx=5)
         self.group_batch_btn.pack(side="left", padx=5)
 
 
@@ -387,6 +462,7 @@ class VerticalApp:
             self.batch_btn.state(["!disabled"])
         else:
             self.batch_btn.state(["disabled"])
+            self.batch_fields = []
 
     def toggle_group_batch(self):
         """切换批量分组字段按钮状态"""
@@ -394,6 +470,7 @@ class VerticalApp:
             self.group_batch_btn.state(["!disabled"])
         else:
             self.group_batch_btn.state(["disabled"])
+            self.group_batch_fields = []
 
     def choose_batch_fields(self):
         """选择多个值字段"""
@@ -443,47 +520,137 @@ class VerticalApp:
         btnf = ttk.Frame(self.root)
         btnf.pack(pady=12)
 
-        ttk.Button(
+        self.calculate_btn = ttk.Button(
             btnf, text="计算捞翔并导出",
             command=self.calculate, width=16
-        ).grid(row=0, column=0, padx=10)
+        )
+        self.calculate_btn.grid(row=0, column=0, padx=10)
 
         ttk.Button(
             btnf, text="小捞翔彩蛋",
             command=self.easter_egg, width=10
         ).grid(row=0, column=1)
 
+    def _build_status_bar(self):
+        self.progress = ttk.Progressbar(self.root, mode="indeterminate")
+        self.progress.pack(fill="x", padx=12, pady=(0, 4))
+        self.progress.pack_forget()
+        self.status_var = tk.StringVar(value=f"{self.mode_label} 就绪")
+        ttk.Label(
+            self.root,
+            textvariable=self.status_var,
+            relief="sunken",
+            anchor="w",
+        ).pack(side="bottom", fill="x")
+
+    def _round_result_frame(self, df, group_fields, need_area):
+        dec = self.area_decimals_var.get()
+
+        def round_dec(value, digits):
+            try:
+                fmt = "0" if digits == 0 else "0." + "0" * digits
+                return float(Decimal(str(value)).quantize(Decimal(fmt), ROUND_HALF_UP))
+            except Exception:
+                return value
+
+        for column in df.columns:
+            if column in group_fields or column in {"数量", "缺失数"}:
+                continue
+            if column == "面积(亩)" and need_area:
+                df[column] = df[column].apply(lambda value: round_dec(value, dec))
+            else:
+                df[column] = df[column].apply(round2)
+        return df
+
+    def _write_export_overview(self, writer, output_path, overview_rows):
+        summary_rows = [
+            {"项目": "导出时间", "内容": time.strftime("%Y-%m-%d %H:%M:%S")},
+            {"项目": "模式", "内容": self.mode_label},
+            {"项目": "源文件", "内容": self.excel_path},
+            {"项目": "数据源", "内容": self.current_sheet_name or "当前数据"},
+            {"项目": "导出文件", "内容": output_path},
+            {"项目": "统计量", "内容": "、".join(self.last_stats)},
+            {"项目": "面积统计", "内容": "是" if self.area_cb.get() else "否"},
+            {"项目": "批量值字段", "内容": "、".join(self.batch_fields) if self.batch_fields else "未启用"},
+            {"项目": "批量分组字段", "内容": "、".join(self.group_batch_fields) if self.group_batch_fields else "未启用"},
+        ]
+        pd.DataFrame(summary_rows).to_excel(writer, index=False, sheet_name="统计说明")
+        if overview_rows:
+            pd.DataFrame(overview_rows).to_excel(writer, index=False, sheet_name="导出清单")
+
+    def _load_path(self, path):
+        self._show_progress("读取文件中...")
+        self.excel_path = path
+        self.lbl_file.config(text=os.path.basename(path))
+        self.add_recent(path)
+
+        if path.lower().endswith(".csv"):
+            self.sheet_menu.set("")
+            self.sheet_menu["values"] = []
+            self.sheet_menu.state(["disabled"])
+            self.calculate_btn.state(["disabled"])
+            threading.Thread(target=self._load_csv_thread, daemon=True).start()
+        else:
+            self.calculate_btn.state(["disabled"])
+            threading.Thread(target=self._load_excel_sheets_thread, daemon=True).start()
+
+    def _load_csv_thread(self):
+        try:
+            df = read_csv_safely(self.excel_path)
+        except Exception as e:
+            message = str(e)
+            self.root.after(
+                0,
+                lambda: (self._hide_progress("就绪"), messagebox.showerror("错误", f"读取失败:\n{message}"))
+            )
+            return
+
+        self.root.after(0, lambda: self._on_sheet_loaded(df, "CSV"))
+
+    def _load_excel_sheets_thread(self):
+        try:
+            sheets = pd.ExcelFile(self.excel_path).sheet_names
+        except Exception as e:
+            message = str(e)
+            self.root.after(
+                0,
+                lambda: (self._hide_progress("就绪"), messagebox.showerror("错误", f"读取失败:\n{message}"))
+            )
+            return
+
+        def on_loaded():
+            self.sheet_menu["values"] = sheets
+            self.sheet_menu.state(["!disabled"])
+            if sheets:
+                self.sheet_var.set(sheets[0])
+                self.load_sheet(sheets[0])
+            else:
+                self._hide_progress("就绪")
+
+        self.root.after(0, on_loaded)
+
     def select_file(self):
         path = filedialog.askopenfilename(
             title="选择 xlsx 文件",
-            filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv"), ("所有文件", "*.*")]
+            filetypes=[("Excel", ("*.xlsx", "*.xls")), ("CSV", "*.csv"), ("所有文件", "*.*")]
         )
         if not path:
             return
-        self.add_recent(path)
-        self.excel_path = path
-        self.lbl_file.config(text=os.path.basename(path))
+        self._load_path(path)
 
-        try:
-            if path.lower().endswith(".csv"):
-                # 如果是CSV文件，直接读取
-                self.data = read_csv_safely(path)
-                self.sheet_menu["values"] = []
-                self.sheet_menu.state(["disabled"])
-                self._on_sheet_loaded(self.data, "CSV")
-            else:
-                # Excel文件
-                sheets = pd.ExcelFile(path).sheet_names
-                self.sheet_menu["values"] = sheets
-                self.sheet_menu.state(["!disabled"])
-                self.sheet_var.set(sheets[0])
-                self.load_sheet(sheets[0])
-        except Exception as e:
-            messagebox.showerror("错误", f"读取失败:\n{e}")
+    def handle_drop(self, event):
+        path = event.data.strip("{}")
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in (".xlsx", ".xls", ".csv"):
+            messagebox.showerror("错误", "只支持拖拽 .xlsx、.xls 或 .csv 文件")
+            return
+        self._load_path(path)
 
     def load_sheet(self, sheet):
         self.sheet_var.set(sheet)
         self.lbl_file.config(text=f"加载中… {sheet}")
+        self.calculate_btn.state(["disabled"])
+        self._show_progress(f"加载子表: {sheet}")
 
         threading.Thread(
             target=self._load_sheet_thread,
@@ -494,9 +661,10 @@ class VerticalApp:
         try:
             df = pd.read_excel(self.excel_path, sheet_name=sheet)
         except Exception as e:
+            message = str(e)
             self.root.after(
                 0,
-                lambda: messagebox.showerror("错误", f"加载失败:\n{e}")
+                lambda: (self._hide_progress("就绪"), messagebox.showerror("错误", f"加载失败:\n{message}"))
             )
             return
 
@@ -504,6 +672,7 @@ class VerticalApp:
 
     def _on_sheet_loaded(self, df, sheet):
         self.data = df
+        self.current_sheet_name = sheet
         self.lbl_file.config(text=os.path.basename(self.excel_path))
 
         cols = list(df.columns)
@@ -524,6 +693,9 @@ class VerticalApp:
         if cols:
             self.val_var.set(cols[-1])
             self.ratio_var.set(cols[-1])
+        self._restore_ui_state(cols)
+        self.calculate_btn.state(["!disabled"])
+        self._hide_progress(f"已加载 {len(df)} 行 / {len(cols)} 列")
 
     def add_level(self):
         if len(self.levels) >= MAX_LEVELS:
@@ -581,20 +753,21 @@ class VerticalApp:
     def choose_stats(self):
         dlg = tk.Toplevel(self.root)
         dlg.title("选择统计量")
+        dlg.geometry("560x360")
 
         vars_ = {}
         for i, stat in enumerate(self.all_stats):
             var = tk.BooleanVar(value=(stat in self.last_stats))
             chk = ttk.Checkbutton(dlg, text=stat, variable=var)
-            chk.grid(row=i // 2, column=i % 2, padx=8, pady=4, sticky="w")
+            chk.grid(row=i // 4, column=i % 4, padx=8, pady=5, sticky="w")
             vars_[stat] = var
 
         ttk.Button(
             dlg, text="确定", width=12,
             command=dlg.destroy
         ).grid(
-            row=(len(self.all_stats) + 1) // 2,
-            column=0, columnspan=2, pady=12
+            row=(len(self.all_stats) + 3) // 4,
+            column=0, columnspan=4, pady=12
         )
 
         dlg.transient(self.root)
@@ -700,88 +873,56 @@ class VerticalApp:
                 messagebox.showerror("错误", f"列 '{f}' 不存在")
                 return
 
-
+        self.calculate_btn.state(["disabled"])
+        self._show_progress("正在计算...")
 
         # 准备输出文件
         base = os.path.splitext(os.path.basename(self.excel_path))[0]
-        out = f"{base}_计算小捞翔后.xlsx"
+        out = build_output_path(self, f"{base}_计算小捞翔后")
 
-        # 创建Excel写入器
+        overview_rows = []
+        skipped = []
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
-            # 循环处理每个值字段和分组组合
             for val in val_fields:
                 for group_fields in group_fields_list:
-                    # 分组聚合
-                    if group_fields:
-                        g = self.data.groupby(group_fields)
-                        agg = g[val].agg(
-                            数量="count",
-                            平均值="mean",
-                            中位值="median",
-                            最大值="max",
-                            最小值="min",
-                            标准差="std"
-                        )
-                        agg["变异系数"] = agg["标准差"] / agg["平均值"]
-                        total_n = agg["数量"].sum()
-                        agg["数量占比"] = agg["数量"] / total_n * 100
-                    else:
-                        # 无分组情况
-                        agg = pd.Series({
-                            "数量": self.data[val].count(),
-                            "平均值": self.data[val].mean(),
-                            "中位值": self.data[val].median(),
-                            "最大值": self.data[val].max(),
-                            "最小值": self.data[val].min(),
-                            "标准差": self.data[val].std(),
-                            "变异系数": self.data[val].std() / self.data[val].mean(),
-                        }, name=val).to_frame().T
-                        total_n = agg["数量"].sum()
-                        agg["数量占比"] = 100.0
+                    df0 = self.data.copy()
+                    df0[val] = pd.to_numeric(df0[val], errors="coerce")
+                    valid_count = int(df0[val].count())
+                    if valid_count == 0:
+                        skipped.append((val, group_fields))
+                        continue
+
+                    if need_area:
+                        df0[ratio] = pd.to_numeric(df0[ratio], errors="coerce")
+                        if group_fields:
+                            area_total = df0.groupby(group_fields, dropna=False)[ratio].sum().reset_index(name="面积(亩)")
+                        else:
+                            area_total = None
+
+                    df = build_grouped_stats_frame(df0, val, group_fields)
 
                     if need_area:
                         if group_fields:
-                            sum_area = g[ratio].sum().rename("面积(亩)")
-                            agg = agg.join(sum_area)
-                            total_area = agg["面积(亩)"].sum()
-                            agg["面积占比"] = agg["面积(亩)"] / total_area * 100
+                            df = df.merge(area_total, on=group_fields, how="left")
+                            total_area = df["面积(亩)"].sum()
                         else:
-                            agg["面积(亩)"] = self.data[ratio].sum()
-                            agg["面积占比"] = 100.0
+                            total_area = float(df0[ratio].sum())
+                            df["面积(亩)"] = total_area
+                        df["面积占比"] = (df["面积(亩)"] / total_area * 100) if total_area else np.nan
 
-                    df = agg.reset_index()
-
-                    # 获取用户设置的面积小数位
-                    dec = self.area_decimals_var.get()
-                    fmt = "0" if dec == 0 else "0." + "0" * dec
-
-                    # 四舍五入
-                    for col in df.columns:
-                        if col not in group_fields + ["数量"]:
-                            if col == "面积(亩)":
-                                df[col] = df[col].apply(lambda x: float(
-                                    Decimal(str(x)).quantize(Decimal(fmt), ROUND_HALF_UP)
-                                ))
-                            else:
-                                df[col] = df[col].apply(round2)
+                    df = self._round_result_frame(df, group_fields, need_area)
+                    df = apply_count_masks(df)
 
                     # 排序
-                    # 在排序部分添加以下代码
                     if group_fields:
-                        # 多级稳定排序：优先按最后一级往前级排序
                         for col in reversed(group_fields):
-                            # 检查该列是否有自定义排序
                             if col in self.custom_orders and self.custom_orders[col]:
-                                # 只用本轮实际出现的值
                                 present = df[col].dropna().unique().tolist()
                                 seq = [v for v in self.custom_orders[col] if v in present]
 
-                                # 确保序列不为空
                                 if seq:
-                                    # 处理数值列
                                     if pd.api.types.is_numeric_dtype(df[col]):
                                         try:
-                                            # 尝试将自定义顺序转换为数值类型
                                             seq = [float(v) if isinstance(v, str) and v.replace('.', '',
                                                                                                 1).isdigit() else v for
                                                    v in seq]
@@ -791,20 +932,18 @@ class VerticalApp:
                                     df[col] = pd.Categorical(df[col], categories=seq, ordered=True)
                                     df = df.sort_values(by=col, kind="stable")
                                 else:
-                                    # 如果自定义序列为空，则使用原始排序
                                     df = df.sort_values(
                                         by=col,
                                         key=lambda s: s.map(sort_key),
                                         kind="stable"
                                     )
                             else:
-                                # 没有自定义排序，使用原始排序
                                 df = df.sort_values(
                                     by=col,
                                     key=lambda s: s.map(sort_key),
                                     kind="stable"
                                 )
-                    # Melt
+
                     if need_area:
                         current_stats = stats + ["面积(亩)", "面积占比"]
                     else:
@@ -816,26 +955,6 @@ class VerticalApp:
                         var_name="指标",
                         value_name="数值"
                     )
-
-                    # 获取每组的样本数量
-                    if group_fields:
-                        qty_map = df.set_index(group_fields)["数量"]
-                        if len(group_fields) == 1:
-                            fld = group_fields[0]
-                            mlt["__数量"] = mlt[fld].map(qty_map)
-                        else:
-                            mlt["__数量"] = mlt[group_fields].apply(
-                                lambda row: qty_map[tuple(row)], axis=1
-                            )
-                    else:
-                        mlt["__数量"] = total_n
-
-                    # 将不满足条件的统计指标设为空值（NaN）
-                    mask_std = (mlt["指标"].isin(["标准差", "变异系数"])) & (mlt["__数量"] <= 5)
-                    mask_minmax = (mlt["指标"].isin(["最大值", "最小值", "中位值"])) & (mlt["__数量"] == 1)
-
-                    mlt.loc[mask_std | mask_minmax, "数值"] = None
-                    mlt.drop(columns="__数量", inplace=True)
 
                     # 强制指标顺序
                     order = {
@@ -856,6 +975,14 @@ class VerticalApp:
                     # 写入sheet
                     mlt.to_excel(writer, index=False, sheet_name=sheet_name)
                     ws = writer.sheets[sheet_name]
+                    overview_rows.append({
+                        "工作表": sheet_name,
+                        "值字段": val,
+                        "分组字段": " / ".join(group_fields) if group_fields else "无分组",
+                        "导出行数": len(mlt),
+                        "有效数量": valid_count,
+                        "面积统计": "是" if need_area else "否",
+                    })
 
                     # 合并分类列
                     if group_fields:
@@ -909,8 +1036,32 @@ class VerticalApp:
                             )
                             cell.border = border
 
+            self._write_export_overview(writer, out, overview_rows)
+
+        if not overview_rows:
+            if os.path.exists(out):
+                os.remove(out)
+            messagebox.showerror("错误", "没有找到可用于统计的数值数据。")
+            self.calculate_btn.state(["!disabled"])
+            return self._hide_progress("就绪")
+
+        if skipped:
+            skipped_text = "\n".join(
+                f"- 值字段 {field} / 分组 {' / '.join(groups) if groups else '无分组'}"
+                for field, groups in skipped[:8]
+            )
+            messagebox.showwarning("部分组合已跳过", f"以下组合没有有效数值，已自动跳过：\n{skipped_text}")
+
         elapsed = round2(time.time() - start_time)
+        self.calculate_btn.state(["!disabled"])
+        self._hide_progress(f"完成: {elapsed}s")
         self.show_result_dialog(out, elapsed)
+
+    def _show_progress(self, text):
+        begin_busy(self, text)
+
+    def _hide_progress(self, text=None):
+        end_busy(self, text)
 
     def easter_egg(self):
         """
@@ -1066,9 +1217,10 @@ class VerticalApp:
         dlg.grab_set()
         self.root.wait_window(dlg)
     def show_result_dialog(self, filepath, elapsed):
+        mark_output(self, filepath)
         dlg = tk.Toplevel(self.root)
         dlg.title("完成")
-        dlg.geometry("450x150")
+        dlg.geometry("620x190")
         dlg.resizable(False, False)
 
         msg = f"已导出文件：\n{filepath}\n\n耗时 {elapsed} 秒"
@@ -1082,9 +1234,15 @@ class VerticalApp:
         ttk.Button(frm, text="预览",
                    command=lambda: self.open_preview(filepath))\
             .grid(row=0, column=1, padx=6)
+        ttk.Button(frm, text="打开文件夹",
+                   command=lambda: open_output_folder(self))\
+            .grid(row=0, column=2, padx=6)
+        ttk.Button(frm, text="复制路径",
+                   command=lambda: copy_text(self, filepath, "导出路径已复制"))\
+            .grid(row=0, column=3, padx=6)
         ttk.Button(frm, text="关闭",
                    command=dlg.destroy)\
-            .grid(row=0, column=2, padx=6)
+            .grid(row=0, column=4, padx=6)
 
         dlg.grab_set()
 

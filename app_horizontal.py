@@ -8,27 +8,48 @@ from decimal import Decimal, ROUND_HALF_UP
 
 import numpy as np
 import pandas as pd
-import sv_ttk
 import tkinter as tk
 from openpyxl.styles import Alignment, Border, Side
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinterdnd2 import DND_FILES
 
-from common_utils import open_with_default_app, read_csv_safely, round2, sort_key
+from common_utils import (
+    EXTENDED_STATS,
+    FILTER_OPERATORS,
+    apply_filter_conditions,
+    apply_count_masks,
+    build_grouped_stats_frame,
+    calculate_series_stats,
+    describe_filter_conditions,
+    open_with_default_app,
+    read_csv_safely,
+    round2,
+    sort_key,
+)
+from ui_shell import (
+    bind_shortcuts,
+    build_output_path,
+    build_app_menu,
+    copy_text,
+    initialize_shell,
+    mark_output,
+    maybe_restore_recent_file,
+    open_output_folder,
+    populate_recent_menus,
+    set_status,
+)
 
 # 当前程序版本号——每次发布时请手动更新
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.2.0"
 
 UPDATE_CONTENT = """
-小捞翔·至尊版 v1.0.8 更新日志：
-- 新增：竖版自定义统计量排序
-- 新增：竖版最近打开
-- 新增：竖版自定义排序
-- 新增：竖版快速打开文件
-- 新增：竖版浏览文件
-- 新增：竖版面积自定义小数位数
-- 修复：在选择横竖版时点击关闭，无法正常关闭
-- 修复：竖版删除被限制行
+小捞翔·至尊版 v1.2.0 更新日志：
+- 新增：扩展统计指标，支持缺失数、缺失率、四分位数、极差、方差、偏度、峰度等
+- 新增：横版支持“插入小计行”开关，统计项里的“合计”现在会作为求和列正常导出
+- 新增：自动生成“统计说明”和“导出清单”工作表，方便回看参数和输出内容
+- 新增：值字段会自动尝试转为数值，无法计算的组合会提示并自动跳过
+- 优化：横版和竖版统计口径统一，更多统计方法在两个界面保持一致
+- 优化：统计量选择面板扩大，容纳更多指标
 """
 
 
@@ -41,24 +62,13 @@ CONFIG_FILE = "small_shit.json"
 class HorizontalApp:
     def __init__(self, root):
         self.root = root
-        root.title("小捞翔·至尊版")
-        root.geometry("570x550")
+        initialize_shell(self, mode_name="horizontal", title="小捞翔")
+        root.geometry("780x720")
+        root.minsize(700, 620)
         root.resizable(True, True)
 
         # 在窗口关闭前保存配置
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-
-
-        sv_ttk.set_theme("light")
-        menubar = tk.Menu(root)
-        tm = tk.Menu(menubar, tearoff=0)
-        tm.add_command(label="Light", command=lambda: sv_ttk.set_theme("light"))
-        tm.add_command(label="Dark",  command=lambda: sv_ttk.set_theme("dark"))
-        menubar.add_cascade(label="Theme", menu=tm)
-        # 关于 → 弹出“更新历史内容”
-        menubar.add_command(label="关于", command=self.show_update_history)
-
-        root.config(menu=menubar)
 
         root.drop_target_register(DND_FILES)
         root.dnd_bind('<<DragEnter>>',  lambda e: root.configure(bg='#e3f2fd'))
@@ -73,11 +83,13 @@ class HorizontalApp:
         self.custom_orders = {}    # 用户确认后的自定义顺序
         self.original_orders = {}
         self.data = pd.DataFrame()
-        self.all_stats = ["数量","平均值","中位值","最大值","最小值",
-                          "标准差","变异系数","数量占比","合计"]
+        self.all_stats = EXTENDED_STATS.copy()
         self.last_stats = self.all_stats.copy()
         self.batch_fields = []
         self.group_batch_fields = []
+        self.filter_conditions = []
+        self.group_templates = {}
+        self.active_group_template_name = ""
 
         # 文件 & Sheet 选择
         frm = ttk.Frame(root); frm.pack(fill='x', padx=12, pady=6)
@@ -151,6 +163,7 @@ class HorizontalApp:
         # 一定要先定义这两个属性
         self.batch_var       = tk.BooleanVar()
         self.group_batch_var = tk.BooleanVar()
+        self.subtotal_var = tk.BooleanVar(value=False)
 
         # 统计量 & 批量 & 自定义排序 分两行布局
         stats_frm = ttk.Frame(root)
@@ -164,6 +177,10 @@ class HorizontalApp:
         ttk.Button(row1, text="自定义统计量顺序", command=self.open_stats_order, width=16)\
             .pack(side='left', padx=6)
         ttk.Button(row1, text="自定义排序", command=self.open_custom_sort, width=10)\
+            .pack(side='left', padx=6)
+        ttk.Button(row1, text="条件筛选", command=self.open_filter_builder, width=10)\
+            .pack(side='left', padx=6)
+        ttk.Button(row1, text="分组模板", command=self.open_group_template_manager, width=10)\
             .pack(side='left', padx=6)
         # 第二行：批量 & 分组 & 自定义排序
         row2 = ttk.Frame(stats_frm)
@@ -190,6 +207,9 @@ class HorizontalApp:
             state="disabled", width=12
         )
         self.group_batch_btn.pack(side='left', padx=6)
+        ttk.Checkbutton(
+            row2, text="插入小计行", variable=self.subtotal_var
+        ).pack(side='left', padx=6)
         sep()
 
         # 操作按钮
@@ -204,7 +224,7 @@ class HorizontalApp:
         # 进度条 & 状态栏
         self.progress = ttk.Progressbar(root, mode="indeterminate")
         self.progress.pack(fill='x', padx=12); self.progress.pack_forget()
-        self.status_var = tk.StringVar(value="就绪")
+        self.status_var = tk.StringVar(value=f"{self.mode_label} 就绪")
         ttk.Label(root, textvariable=self.status_var, relief='sunken',
                   anchor='w').pack(side='bottom', fill='x')
 
@@ -215,8 +235,11 @@ class HorizontalApp:
         self.advanced_order = getattr(self, "advanced_order",
                                       {"groups": [], "stats": [], "exports": []})
 
+        build_app_menu(self)
+        bind_shortcuts(self)
         self.create_recent_menu()
         self.check_for_update()
+        maybe_restore_recent_file(self)
     def show_update_history(self):
         history = getattr(self, "update_history", [])
         if not history:
@@ -225,7 +248,7 @@ class HorizontalApp:
 
         dlg = tk.Toplevel(self.root)
         dlg.title("更新历史")
-        dlg.geometry("400x300")
+        dlg.geometry("520x360")
         dlg.resizable(False, False)
 
         frm = ttk.Frame(dlg, padding=8)
@@ -248,7 +271,7 @@ class HorizontalApp:
         if getattr(self, "shown_version", "") != APP_VERSION:
             dlg = tk.Toplevel(self.root)
             dlg.title(f"更新日志  v{APP_VERSION}")
-            dlg.geometry("400x300")
+            dlg.geometry("520x360")
             dlg.resizable(False, False)
 
             # — 文本区 —
@@ -290,7 +313,11 @@ class HorizontalApp:
             "recent_files": self.recent_files,
             "shown_version": getattr(self, "shown_version", ""),
             "update_history": getattr(self, "update_history", []),
-            "area_decimals": self.area_decimals_var.get()
+            "area_decimals": self.area_decimals_var.get(),
+            "ui_state": self._collect_ui_state(),
+            "filter_conditions": self.filter_conditions,
+            "group_templates": self.group_templates,
+            "active_group_template_name": self.active_group_template_name,
         }
         cfg_path = path or CONFIG_FILE
         try:
@@ -336,6 +363,10 @@ class HorizontalApp:
             # 面积小数位：默认为已有控件的当前值
             dec = cfg.get("area_decimals", self.area_decimals_var.get())
             self.area_decimals_var.set(dec)
+            self.saved_ui_state = cfg.get("ui_state", {})
+            self.filter_conditions = cfg.get("filter_conditions", [])
+            self.group_templates = cfg.get("group_templates", {})
+            self.active_group_template_name = cfg.get("active_group_template_name", "")
 
         except Exception as e:
             messagebox.showerror("加载失败", str(e))
@@ -344,6 +375,497 @@ class HorizontalApp:
         # 退出前保存配置
         self.save_config(show_msg=False)
         self.root.destroy()
+
+    def _collect_ui_state(self):
+        return {
+            "levels": [lvl["var"].get() for lvl in self.levels if lvl["var"].get()],
+            "value_field": self.val_var.get(),
+            "ratio_field": self.ratio_var.get(),
+            "value_enabled": bool(self.val_enable_var.get()),
+            "area_enabled": bool(self.area_cb.get()),
+            "batch_enabled": bool(self.batch_var.get()),
+            "batch_fields": list(self.batch_fields),
+            "group_batch_enabled": bool(self.group_batch_var.get()),
+            "group_batch_fields": list(self.group_batch_fields),
+            "subtotal_enabled": bool(self.subtotal_var.get()),
+        }
+
+    def _set_level_count(self, target_count):
+        target_count = max(1, min(MAX_LEVELS, target_count))
+        while len(self.levels) < target_count:
+            self.add_level()
+        while len(self.levels) > target_count:
+            self._remove_level(self.levels[-1]["btn"])
+
+    def _restore_ui_state(self, cols):
+        state = getattr(self, "saved_ui_state", {})
+        if not isinstance(state, dict):
+            return
+
+        saved_levels = [field for field in state.get("levels", []) if field in cols]
+        if saved_levels:
+            self._set_level_count(len(saved_levels))
+            for idx, lvl in enumerate(self.levels):
+                if idx < len(saved_levels):
+                    lvl["var"].set(saved_levels[idx])
+                elif cols:
+                    lvl["var"].set(cols[0])
+
+        saved_value = state.get("value_field")
+        saved_ratio = state.get("ratio_field")
+        if saved_value in cols:
+            self.val_var.set(saved_value)
+        if saved_ratio in cols:
+            self.ratio_var.set(saved_ratio)
+
+        self.val_enable_var.set(bool(state.get("value_enabled", self.val_enable_var.get())))
+        self.toggle_value_field()
+        if self.val_enable_var.get() and saved_value in cols:
+            self.val_var.set(saved_value)
+
+        self.area_cb.set(bool(state.get("area_enabled", self.area_cb.get())))
+        self.toggle_area_fields()
+        if self.area_cb.get() and saved_ratio in cols:
+            self.ratio_var.set(saved_ratio)
+
+        self.batch_var.set(bool(state.get("batch_enabled", False)))
+        self.toggle_batch()
+        self.batch_fields = [field for field in state.get("batch_fields", []) if field in cols]
+
+        self.group_batch_var.set(bool(state.get("group_batch_enabled", False)))
+        self.toggle_group_batch()
+        self.group_batch_fields = [field for field in state.get("group_batch_fields", []) if field in cols]
+        self.subtotal_var.set(bool(state.get("subtotal_enabled", self.subtotal_var.get())))
+
+    def _normalize_filter_conditions(self, cols):
+        normalized = []
+        for condition in getattr(self, "filter_conditions", []):
+            if not isinstance(condition, dict):
+                continue
+            field = str(condition.get("field", "")).strip()
+            op = str(condition.get("op", "")).strip()
+            if field and op and field in cols:
+                normalized.append(
+                    {
+                        "field": field,
+                        "op": op,
+                        "value": str(condition.get("value", "")),
+                        "enabled": bool(condition.get("enabled", True)),
+                    }
+                )
+        self.filter_conditions = normalized
+
+    def _filter_summary(self):
+        active_conditions = [c for c in self.filter_conditions if c.get("enabled", True)]
+        return describe_filter_conditions(active_conditions)
+
+    def _get_filtered_data(self, show_error=True):
+        if self.data.empty:
+            return self.data.copy()
+
+        try:
+            return apply_filter_conditions(self.data, self.filter_conditions)
+        except Exception as exc:
+            if show_error:
+                messagebox.showerror("筛选条件有误", str(exc))
+                set_status(self, "筛选条件有误，请检查后再试")
+            return None
+
+    def get_active_data(self):
+        filtered = self._get_filtered_data(show_error=False)
+        if isinstance(filtered, pd.DataFrame):
+            return filtered
+        return self.data
+
+    def _update_loaded_status(self):
+        if self.data.empty:
+            set_status(self, f"{self.mode_label} 就绪")
+            return
+
+        total_rows = len(self.data)
+        total_cols = len(self.data.columns)
+        if not self.filter_conditions:
+            set_status(self, f"已加载 {total_rows} 行 / {total_cols} 列")
+            return
+
+        filtered = self._get_filtered_data(show_error=False)
+        if filtered is None:
+            set_status(self, f"已加载 {total_rows} 行 / {total_cols} 列，筛选条件待修正")
+            return
+
+        set_status(self, f"已加载 {total_rows} 行 / {total_cols} 列，筛选后 {len(filtered)} 行")
+
+    def _collect_group_template(self):
+        return {
+            "ui_state": self._collect_ui_state(),
+            "stats": list(self.last_stats),
+        }
+
+    def _describe_group_template(self, name, payload):
+        state = payload.get("ui_state", {}) if isinstance(payload, dict) else {}
+        stats = payload.get("stats", []) if isinstance(payload, dict) else []
+        lines = [
+            f"模板名称：{name}",
+            f"分类级别：{' / '.join(state.get('levels', [])) or '未设置'}",
+            f"值字段：{state.get('value_field') or '未设置'}",
+            f"面积字段：{state.get('ratio_field') or '未设置'}",
+            f"启用值字段：{'是' if state.get('value_enabled', True) else '否'}",
+            f"面积统计：{'是' if state.get('area_enabled', False) else '否'}",
+            f"批量值字段：{' / '.join(state.get('batch_fields', [])) or '未启用'}",
+            f"批量分组字段：{' / '.join(state.get('group_batch_fields', [])) or '未启用'}",
+            f"插入小计行：{'是' if state.get('subtotal_enabled', False) else '否'}",
+            f"统计量：{' / '.join(stats) if stats else '未设置'}",
+        ]
+        return "\n".join(lines)
+
+    def _apply_group_template(self, payload, template_name=""):
+        if self.data.empty:
+            messagebox.showwarning("提示", "请先加载数据后再应用模板")
+            return False
+
+        if not isinstance(payload, dict):
+            messagebox.showerror("错误", "模板内容无效")
+            return False
+
+        state = payload.get("ui_state", {})
+        if not isinstance(state, dict):
+            messagebox.showerror("错误", "模板缺少界面配置")
+            return False
+
+        cols = list(self.data.columns)
+        enabled_fields = list(state.get("levels", []))
+        if state.get("value_enabled", True) and state.get("value_field"):
+            enabled_fields.append(state.get("value_field"))
+        if state.get("area_enabled", False) and state.get("ratio_field"):
+            enabled_fields.append(state.get("ratio_field"))
+        if state.get("batch_enabled", False):
+            enabled_fields.extend(state.get("batch_fields", []))
+        if state.get("group_batch_enabled", False):
+            enabled_fields.extend(state.get("group_batch_fields", []))
+
+        missing_fields = sorted({field for field in enabled_fields if field and field not in cols})
+        if missing_fields:
+            messagebox.showwarning("模板无法应用", "当前数据缺少以下字段：\n" + "\n".join(missing_fields))
+            return False
+
+        self.saved_ui_state = state
+        self._restore_ui_state(cols)
+        stats = [stat for stat in payload.get("stats", []) if stat in self.all_stats]
+        if stats:
+            self.last_stats = stats
+        self.active_group_template_name = template_name
+        self._update_loaded_status()
+        return True
+
+    def open_group_template_manager(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("分组模板")
+        dialog.geometry("720x420")
+        dialog.transient(self.root)
+
+        container = ttk.Frame(dialog, padding=12)
+        container.pack(fill="both", expand=True)
+        container.columnconfigure(1, weight=1)
+        container.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(container)
+        left.grid(row=0, column=0, sticky="ns", padx=(0, 12))
+        right = ttk.Frame(container)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.rowconfigure(1, weight=1)
+
+        ttk.Label(left, text="已保存模板").pack(anchor="w")
+        listbox = tk.Listbox(left, width=24, height=16)
+        listbox.pack(fill="y", expand=True, pady=(6, 8))
+
+        ttk.Label(right, text="模板内容").grid(row=0, column=0, sticky="w")
+        preview = tk.Text(right, wrap="word", state="disabled", height=16)
+        preview.grid(row=1, column=0, sticky="nsew", pady=(6, 8))
+
+        buttons = ttk.Frame(right)
+        buttons.grid(row=2, column=0, sticky="e")
+
+        def selected_name():
+            selection = listbox.curselection()
+            if not selection:
+                return ""
+            return listbox.get(selection[0])
+
+        def refresh_templates(target_name=""):
+            names = sorted(self.group_templates)
+            listbox.delete(0, "end")
+            for name in names:
+                listbox.insert("end", name)
+
+            if target_name and target_name in names:
+                index = names.index(target_name)
+                listbox.selection_set(index)
+                listbox.see(index)
+            elif names:
+                listbox.selection_set(0)
+
+            update_preview()
+
+        def update_preview(_event=None):
+            name = selected_name()
+            content = "暂无模板"
+            if name:
+                content = self._describe_group_template(name, self.group_templates.get(name, {}))
+            preview.configure(state="normal")
+            preview.delete("1.0", "end")
+            preview.insert("1.0", content)
+            preview.configure(state="disabled")
+
+        def save_current_template():
+            if self.data.empty:
+                messagebox.showwarning("提示", "请先加载数据后再保存模板")
+                return
+
+            initial_name = self.active_group_template_name or selected_name() or "常用模板"
+            name = simpledialog.askstring("保存模板", "请输入模板名称：", parent=dialog, initialvalue=initial_name)
+            if not name:
+                return
+            name = name.strip()
+            if not name:
+                return
+
+            self.group_templates[name] = self._collect_group_template()
+            self.active_group_template_name = name
+            self.save_config(show_msg=False)
+            refresh_templates(name)
+            set_status(self, f"模板“{name}”已保存")
+
+        def apply_selected_template():
+            name = selected_name()
+            if not name:
+                messagebox.showinfo("提示", "请先选择一个模板")
+                return
+            if self._apply_group_template(self.group_templates.get(name, {}), name):
+                self.save_config(show_msg=False)
+                dialog.destroy()
+
+        def delete_selected_template():
+            name = selected_name()
+            if not name:
+                return
+            if not messagebox.askyesno("确认删除", f"确定要删除模板“{name}”吗？", parent=dialog):
+                return
+            self.group_templates.pop(name, None)
+            if self.active_group_template_name == name:
+                self.active_group_template_name = ""
+            self.save_config(show_msg=False)
+            refresh_templates()
+
+        def export_selected_template():
+            name = selected_name()
+            if not name:
+                messagebox.showinfo("提示", "请先选择一个模板")
+                return
+            path = filedialog.asksaveasfilename(
+                title="导出模板",
+                defaultextension=".json",
+                filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+                initialfile=f"{name}.json",
+            )
+            if not path:
+                return
+            with open(path, "w", encoding="utf-8") as file:
+                json.dump({"name": name, "template": self.group_templates[name]}, file, ensure_ascii=False, indent=2)
+            set_status(self, f"模板已导出到 {os.path.basename(path)}")
+
+        def import_template():
+            path = filedialog.askopenfilename(
+                title="导入模板",
+                filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+            )
+            if not path:
+                return
+
+            with open(path, "r", encoding="utf-8") as file:
+                payload = json.load(file)
+
+            if isinstance(payload, dict) and "template" in payload:
+                name = str(payload.get("name") or os.path.splitext(os.path.basename(path))[0]).strip()
+                template = payload.get("template", {})
+            else:
+                name = os.path.splitext(os.path.basename(path))[0]
+                template = payload
+
+            if not name or not isinstance(template, dict):
+                messagebox.showerror("导入失败", "模板文件格式不正确")
+                return
+
+            self.group_templates[name] = template
+            self.save_config(show_msg=False)
+            refresh_templates(name)
+            set_status(self, f"模板“{name}”已导入")
+
+        ttk.Button(buttons, text="保存当前", command=save_current_template).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="应用", command=apply_selected_template).pack(side="left", padx=6)
+        ttk.Button(buttons, text="删除", command=delete_selected_template).pack(side="left", padx=6)
+        ttk.Button(buttons, text="导出", command=export_selected_template).pack(side="left", padx=6)
+        ttk.Button(buttons, text="导入", command=import_template).pack(side="left", padx=6)
+        ttk.Button(buttons, text="关闭", command=dialog.destroy).pack(side="left", padx=(6, 0))
+
+        listbox.bind("<<ListboxSelect>>", update_preview)
+        refresh_templates(self.active_group_template_name)
+        dialog.grab_set()
+        self.root.wait_window(dialog)
+
+    def open_filter_builder(self):
+        if self.data.empty:
+            messagebox.showwarning("提示", "请先加载数据后再设置筛选条件")
+            return
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("条件筛选")
+        dialog.geometry("760x420")
+        dialog.transient(self.root)
+
+        container = ttk.Frame(dialog, padding=12)
+        container.pack(fill="both", expand=True)
+        container.rowconfigure(1, weight=1)
+        container.columnconfigure(0, weight=1)
+
+        ttk.Label(container, text=f"当前数据共 {len(self.data)} 行，可添加多个筛选条件。").grid(row=0, column=0, sticky="w")
+
+        rows_frame = ttk.Frame(container)
+        rows_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 8))
+        rows_frame.columnconfigure(0, weight=1)
+
+        summary_var = tk.StringVar()
+        detail_var = tk.StringVar(value=self._filter_summary())
+        condition_rows = []
+        cols = list(self.data.columns)
+
+        def collect_conditions():
+            conditions = []
+            for item in condition_rows:
+                field = item["field"].get().strip()
+                op = item["op"].get().strip()
+                value = item["value"].get().strip()
+                enabled = bool(item["enabled"].get())
+                if field and op:
+                    conditions.append(
+                        {
+                            "field": field,
+                            "op": op,
+                            "value": value,
+                            "enabled": enabled,
+                        }
+                    )
+            return conditions
+
+        def refresh_summary():
+            conditions = collect_conditions()
+            active_conditions = [c for c in conditions if c.get("enabled", True)]
+            detail_var.set(describe_filter_conditions(active_conditions))
+            try:
+                filtered = apply_filter_conditions(self.data, conditions)
+            except Exception as exc:
+                summary_var.set(f"条件有误：{exc}")
+                return
+
+            if active_conditions:
+                summary_var.set(f"已启用 {len(active_conditions)} 条，筛选后 {len(filtered)} / {len(self.data)} 行")
+            else:
+                summary_var.set(f"当前未启用筛选，将使用全部 {len(self.data)} 行数据")
+
+        def remove_condition(item):
+            item["frame"].destroy()
+            if item in condition_rows:
+                condition_rows.remove(item)
+            if not condition_rows:
+                add_condition_row()
+            refresh_summary()
+
+        def add_condition_row(condition=None):
+            condition = condition or {}
+            frame = ttk.Frame(rows_frame)
+            frame.pack(fill="x", pady=4)
+
+            enabled_var = tk.BooleanVar(value=bool(condition.get("enabled", True)))
+            field_var = tk.StringVar(value=str(condition.get("field", cols[0] if cols else "")))
+            op_var = tk.StringVar(value=str(condition.get("op", FILTER_OPERATORS[0])))
+            value_var = tk.StringVar(value=str(condition.get("value", "")))
+
+            ttk.Checkbutton(frame, text="启用", variable=enabled_var, command=refresh_summary).pack(side="left")
+            field_box = ttk.Combobox(frame, values=cols, textvariable=field_var, state="readonly", width=20)
+            field_box.pack(side="left", padx=(8, 6))
+            op_box = ttk.Combobox(frame, values=FILTER_OPERATORS, textvariable=op_var, state="readonly", width=12)
+            op_box.pack(side="left", padx=6)
+            value_entry = ttk.Entry(frame, textvariable=value_var, width=22)
+            value_entry.pack(side="left", padx=6)
+
+            item = {
+                "frame": frame,
+                "enabled": enabled_var,
+                "field": field_var,
+                "op": op_var,
+                "value": value_var,
+            }
+
+            def sync_value_state(*_args):
+                disabled = op_var.get() in {"为空", "不为空"}
+                value_entry.configure(state="disabled" if disabled else "normal")
+                if disabled:
+                    value_var.set("")
+                refresh_summary()
+
+            op_var.trace_add("write", sync_value_state)
+            field_box.bind("<<ComboboxSelected>>", lambda _event: refresh_summary())
+            value_entry.bind("<KeyRelease>", lambda _event: refresh_summary())
+            ttk.Button(frame, text="删除", command=lambda: remove_condition(item)).pack(side="left", padx=(6, 0))
+            condition_rows.append(item)
+            sync_value_state()
+
+        controls = ttk.Frame(container)
+        controls.grid(row=2, column=0, sticky="ew")
+        ttk.Button(controls, text="新增条件", command=add_condition_row).pack(side="left")
+        ttk.Button(
+            controls,
+            text="清空筛选",
+            command=lambda: (
+                [row["frame"].destroy() for row in condition_rows],
+                condition_rows.clear(),
+                self.filter_conditions.clear(),
+                add_condition_row(),
+                refresh_summary(),
+            ),
+        ).pack(side="left", padx=6)
+
+        ttk.Label(container, textvariable=summary_var).grid(row=3, column=0, sticky="w", pady=(10, 2))
+        ttk.Label(container, textvariable=detail_var, wraplength=700).grid(row=4, column=0, sticky="w")
+
+        buttons = ttk.Frame(container)
+        buttons.grid(row=5, column=0, sticky="e", pady=(12, 0))
+
+        def apply_conditions():
+            conditions = collect_conditions()
+            try:
+                filtered = apply_filter_conditions(self.data, conditions)
+            except Exception as exc:
+                messagebox.showerror("筛选条件有误", str(exc), parent=dialog)
+                return
+
+            self.filter_conditions = [c for c in conditions if c.get("enabled", True)]
+            self._update_loaded_status()
+            self.save_config(show_msg=False)
+            if self.filter_conditions:
+                set_status(self, f"筛选已更新，当前保留 {len(filtered)} 行")
+            else:
+                set_status(self, f"已清除筛选，当前共 {len(self.data)} 行")
+            dialog.destroy()
+
+        ttk.Button(buttons, text="应用", command=apply_conditions).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="关闭", command=dialog.destroy).pack(side="left")
+
+        existing_conditions = self.filter_conditions or [{}]
+        for condition in existing_conditions:
+            add_condition_row(condition)
+        refresh_summary()
+        dialog.grab_set()
+        self.root.wait_window(dialog)
 
     def open_stats_order(self):
         dlg = tk.Toplevel(self.root)
@@ -630,16 +1152,8 @@ class HorizontalApp:
 
     # 整表总计行
     def _append_overall_total(self, final, df, gf, val, ratio, need_area):
-        stats_map = {
-            "数量": df[val].count(),
-            "平均值": round2(df[val].mean()),
-            "中位值": round2(df[val].median()),
-            "最大值": round2(df[val].max()),
-            "最小值": round2(df[val].min()),
-            "标准差": round2(df[val].std()),
-            "变异系数": round2(df[val].std() / df[val].mean() if df[val].mean() else np.nan),
-            "数量占比": round2(100.0),
-        }
+        stats_map = calculate_series_stats(df[val], int(pd.to_numeric(df[val], errors="coerce").count()))
+        stats_map["数量占比"] = round2(100.0)
         if need_area:
             total_area = df[ratio].sum()
 
@@ -658,6 +1172,42 @@ class HorizontalApp:
 
         overall_df = pd.DataFrame([total_row], columns=final.columns)
         return pd.concat([final, overall_df], ignore_index=True)
+
+    def _round_result_frame(self, df, group_fields, need_area):
+        dec = self.area_decimals_var.get()
+
+        def round_dec(value, digits):
+            try:
+                fmt = "0" if digits == 0 else "0." + "0" * digits
+                return float(Decimal(str(value)).quantize(Decimal(fmt), ROUND_HALF_UP))
+            except Exception:
+                return value
+
+        for column in df.columns:
+            if column in group_fields or column in {"数量", "缺失数"}:
+                continue
+            if column == "面积(亩)" and need_area:
+                df[column] = df[column].apply(lambda value: round_dec(value, dec))
+            else:
+                df[column] = df[column].apply(round2)
+        return df
+
+    def _write_export_overview(self, writer, output_path, overview_rows):
+        summary_rows = [
+            {"项目": "导出时间", "内容": time.strftime("%Y-%m-%d %H:%M:%S")},
+            {"项目": "模式", "内容": self.mode_label},
+            {"项目": "源文件", "内容": self.excel_path},
+            {"项目": "数据源", "内容": self.current_sheet_name or "当前数据"},
+            {"项目": "导出文件", "内容": output_path},
+            {"项目": "统计量", "内容": "、".join(self.last_stats)},
+            {"项目": "插入小计行", "内容": "是" if self.subtotal_var.get() else "否"},
+            {"项目": "面积统计", "内容": "是" if self.area_cb.get() else "否"},
+            {"项目": "批量值字段", "内容": "、".join(self.batch_fields) if self.batch_fields else "未启用"},
+            {"项目": "批量分组字段", "内容": "、".join(self.group_batch_fields) if self.group_batch_fields else "未启用"},
+        ]
+        pd.DataFrame(summary_rows).to_excel(writer, index=False, sheet_name="统计说明")
+        if overview_rows:
+            pd.DataFrame(overview_rows).to_excel(writer, index=False, sheet_name="导出清单")
 
     # 文件 & 数据加载
     def toggle_area_fields(self):
@@ -756,6 +1306,8 @@ class HorizontalApp:
     def _on_data(self, df):
         self._hide_progress()
         self.data = df
+        ext = os.path.splitext(self.excel_path)[1].lower()
+        self.current_sheet_name = "CSV" if ext == ".csv" else (self.sheet_var.get() or "当前子表")
 
         cols = list(df.columns)
         for cmb in (self.val_menu, self.ratio_menu):
@@ -764,8 +1316,8 @@ class HorizontalApp:
             self.val_var.set(cols[-1])
             self.ratio_var.set(cols[-1])
         self._refresh_levels(cols)
+        self._restore_ui_state(cols)
 
-        ext = os.path.splitext(self.excel_path)[1].lower()
         if ext == ".csv":
             self.sheet_menu.set("")
             self.sheet_menu["values"] = []
@@ -776,6 +1328,7 @@ class HorizontalApp:
 
         self.toggle_area_fields()
         self.calculate_btn.state(["!disabled"])
+        set_status(self, f"已加载 {len(df)} 行 / {len(cols)} 列")
 
     def _refresh_levels(self, cols):
         for lvl in self.levels:
@@ -822,7 +1375,7 @@ class HorizontalApp:
     def choose_stats(self):
         dlg = tk.Toplevel(self.root)
         dlg.title("选择统计量")
-        dlg.geometry("300x260")
+        dlg.geometry("560x360")
         frm = ttk.Frame(dlg)
         frm.pack(padx=12, pady=12)
         ttk.Label(frm, text="请选择统计量:").pack(pady=(0,8))
@@ -834,16 +1387,9 @@ class HorizontalApp:
         for i, st in enumerate(self.all_stats):
             v = tk.BooleanVar(value=(st in self.last_stats))
             cb = ttk.Checkbutton(chkf, text=st, variable=v)
-            cb.grid(row=i//3, column=i%3, padx=6, pady=4, sticky='w')
+            cb.grid(row=i//4, column=i%4, padx=8, pady=5, sticky='w')
             tmp[st] = v
             cbs[st] = cb
-            # ——— 如果只有一级分类，则自动取消“合计”的勾选（并可选禁用它） ———
-        active_levels = sum(1 for lvl in self.levels if lvl['var'].get())
-        if active_levels <= 1 and "合计" in tmp:
-            # 取消勾选
-            tmp["合计"].set(False)
-            # 可选：禁用这个 Checkbutton，防止用户再勾上
-            cbs["合计"].state(["disabled"])
         ttk.Button(frm, text="确定", command=dlg.destroy, width=10).pack(pady=8)
         dlg.grab_set()
         self.root.wait_window(dlg)
@@ -863,17 +1409,8 @@ class HorizontalApp:
 
 
     def create_recent_menu(self):
-        """根据 self.recent_files 构建下拉菜单。"""
-        self.recent_menu.delete(0, 'end')
-        for path in self.recent_files:
-            label = os.path.basename(path)
-            # 菜单项回调：打开并更新最近记录
-            self.recent_menu.add_command(
-                label=label,
-                command=lambda p=path: self.open_recent(p)
-            )
-        if not self.recent_files:
-            self.recent_menu.add_command(label="— 无记录 —", state="disabled")
+        """根据 self.recent_files 构建最近打开菜单。"""
+        populate_recent_menus(self)
 
     def add_recent(self, path):
         """将 path 插入到最近打开列表顶端，去重并限长20，静默保存。"""
@@ -914,25 +1451,10 @@ class HorizontalApp:
 
         # 默认分类级别
         gf = [l["var"].get() for l in self.levels if l["var"].get()]
-
-        # 批量值字段
-        fields = [self.val_var.get()]
-        invalid = [f for f in fields
-                   if f and not pd.api.types.is_numeric_dtype(self.data[f])]
-
-        if invalid:
-            # 弹警告，提示哪些字段有问题，然后中断
-            messagebox.showwarning(
-                "字段类型错误",
-                f"以下值字段包含非数值或全部字符串，无法计算：\n{invalid}"
-            )
-            return self._hide_progress("就绪")
-
-        # 正常开始计时和进度条
-        start = time.time()
-        self._show_progress("正在计算...")
         if self.batch_var.get() and getattr(self, "batch_fields", None):
-            fields = self.batch_fields or fields
+            fields = self.batch_fields or [self.val_var.get()]
+        else:
+            fields = [self.val_var.get()]
 
         # 批量分组字段
         groups = []
@@ -944,7 +1466,6 @@ class HorizontalApp:
         group_on = self.group_batch_var.get()
 
         # 取出 fields, groups
-        fields = [self.val_var.get()]
         if batch_on and getattr(self, "batch_fields", None):
             fields = self.batch_fields or fields
 
@@ -984,27 +1505,30 @@ class HorizontalApp:
             loops = [(self.val_var.get(),
                       [l["var"].get() for l in self.levels if l["var"].get()])]
 
-        # 打个日志，确认 loops 里到底有哪些组合
-        print("DEBUG loops:", loops)
         ratio = self.ratio_var.get()
         need_area = self.area_cb.get()
-        need_sub = ("合计" in self.last_stats)
+        need_sub = bool(self.subtotal_var.get())
 
         basename = os.path.splitext(os.path.basename(self.excel_path))[0]
-
-        out = f"{basename}_结果.xlsx"
+        out = build_output_path(self, f"{basename}_结果")
 
         # 如果没有任何可统计的(field, group)组合，提前退出
         if not loops:
             messagebox.showerror("错误", "没有可统计的值/分组组合，无法导出")
             return self._hide_progress("就绪")
 
+        overview_rows = []
+        skipped = []
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
             for field, gf_current in loops:
                 self.status_var.set(f"计算: 值字段={field}, 分组={gf_current}")
 
                 df0 = self.data.copy()
                 df0[field] = pd.to_numeric(df0[field], errors="coerce")
+                valid_count = int(df0[field].count())
+                if valid_count == 0:
+                    skipped.append((field, gf_current))
+                    continue
 
                 # 仅在需要面积占比时才处理 ratio 列
                 if need_area:
@@ -1013,77 +1537,26 @@ class HorizontalApp:
                 else:
                     area_total = None
 
-                # 聚合
-                if gf_current:
-                    g = df0.groupby(gf_current)
-                    agg = g[field].agg(
-                        数量="count", 平均值="mean", 中位值="median",
-                        最大值="max", 最小值="min", 标准差="std"
-                    )
-                else:
-                    n = df0[field].count()
-                    agg = pd.DataFrame({
-                        "数量": [n],
-                        "平均值": [df0[field].mean()],
-                        "中位值": [df0[field].median()],
-                        "最大值": [df0[field].max()],
-                        "最小值": [df0[field].min()],
-                        "标准差": [df0[field].std()],
-                    })
-
-                agg["变异系数"] = agg["标准差"] / agg["平均值"]
-                agg["数量占比"] = agg["数量"] / agg["数量"].sum() * 100
+                res = build_grouped_stats_frame(df0, field, gf_current)
 
                 if need_area:
                     if gf_current:
-                        agg["面积(亩)"] = g[ratio].sum()
+                        area_df = df0.groupby(gf_current, dropna=False)[ratio].sum().reset_index(name="面积(亩)")
+                        res = res.merge(area_df, on=gf_current, how="left")
+                        total_area = res["面积(亩)"].sum()
                     else:
-                        agg["面积(亩)"] = area_total
-                    agg["面积占比"] = agg["面积(亩)"] / area_total * 100
+                        total_area = float(area_total) if area_total is not None else 0.0
+                        res["面积(亩)"] = total_area
+                    res["面积占比"] = (res["面积(亩)"] / total_area * 100) if total_area else np.nan
 
-                res = agg.reset_index()
-
-                # 四舍五入 & 基本排序
-                # 用户选的面积小数位
-                dec = self.area_decimals_var.get()
-
-                def round_dec(x, d):
-                    try:
-                        fmt = "0" if d == 0 else "0." + "0" * d
-                        return float(Decimal(str(x)).quantize(Decimal(fmt), ROUND_HALF_UP))
-                    except:
-                        return x
-
-                for c in res.select_dtypes(include="number").columns:
-                    # 跳过分类列和 数量 列
-                    if c in gf_current + ["数量"]:
-                        continue
-
-                    if c == "面积(亩)":
-                        # 面积按用户设置的小数位
-                        res[c] = res[c].apply(lambda x: round_dec(x, dec))
-                    elif c == "面积占比":
-                        # 面积占比固定两位
-                        res[c] = res[c].apply(round2)
-                    else:
-                        # 其它列仍然两位
-                        res[c] = res[c].apply(round2)
-
-                # 阈值过滤
-                filtered = res.copy()
-                cnt_ser = filtered["数量"]
-                if "标准差" in filtered.columns and "变异系数" in filtered.columns:
-                    filtered.loc[cnt_ser <= 5, ["标准差", "变异系数"]] = np.nan
-                for stat in ("最大值", "最小值", "中位值"):
-                    if stat in filtered.columns:
-                        filtered.loc[cnt_ser <= 1, stat] = np.nan
+                res = self._round_result_frame(res, gf_current, need_area)
+                filtered = apply_count_masks(res)
 
                 # 列切片
-                display_cols = gf_current + [s for s in self.last_stats if s != "合计"]
+                display_cols = gf_current + self.last_stats.copy()
                 if need_area:
                     display_cols += ["面积(亩)", "面积占比"]
                 tmp = filtered[display_cols].copy()
-                  # —— 1）先对 tmp 排序（仅对数据行，不含小计/总计） ——
 
                 # —— 多级稳定排序 ——
                 if gf_current:
@@ -1108,31 +1581,32 @@ class HorizontalApp:
 
                 # 小计逻辑：仅当 need_sub 且有分组时，并且该组行数 >1 才输出小计
                 if need_sub and gf_current:
-                    # 统计每个一级分组的行数
-                    grp_counts = tmp[gf_current[0]].value_counts().to_dict()
+                    def _group_key(value):
+                        return "__NA__" if pd.isna(value) else value
+
+                    grp_counts = {_group_key(key): count for key, count in tmp[gf_current[0]].value_counts(dropna=False).items()}
 
                     out_rows = []
                     prev = None
+                    prev_key = None
                     for _, r in tmp.iterrows():
                         cur = r[gf_current[0]]
+                        cur_key = _group_key(cur)
                         # 切组边界时，只有上一个组大小>1，才插小计
-                        if prev is not None and cur != prev and grp_counts.get(prev, 0) > 1:
+                        if prev is not None and cur_key != prev_key and grp_counts.get(prev_key, 0) > 1:
                             out_rows.append(
                                 self._subtotal(
-                                    prev, gf_current, field, ratio,
-                                    df0[field].count(),
-                                    area_total, need_area
+                                    prev, df0, gf_current, field, ratio, need_area
                                 )
                             )
                         out_rows.append(r.to_dict())
                         prev = cur
+                        prev_key = cur_key
                     # 最后一组结束后，若该组大小>1，则插小计
-                    if prev is not None and grp_counts.get(prev, 0) > 1:
+                    if prev is not None and grp_counts.get(prev_key, 0) > 1:
                         out_rows.append(
                             self._subtotal(
-                                prev, gf_current, field, ratio,
-                                df0[field].count(),
-                                area_total, need_area
+                                prev, df0, gf_current, field, ratio, need_area
                             )
                         )
                     final_df = pd.DataFrame(out_rows, columns=tmp.columns)
@@ -1141,25 +1615,31 @@ class HorizontalApp:
 
                 # 整表总计行
                 final_df = self._append_overall_total(
-                    final_df, self.data, gf_current, field,
+                    final_df, df0, gf_current, field,
                     ratio, need_area
                 )
 
-
                 # 写入 Sheet
-                # 新的 sheet 名：field + 所有分组，防止同名覆盖
-                # gf_current 是一个 list，如果只有一级就只有一个元素
                 name_parts = [field] + gf_current
                 sheet_name = "_".join(name_parts)[:31]
                 final_df.to_excel(writer, index=False, sheet_name=sheet_name)
                 ws = writer.sheets[sheet_name]
+                overview_rows.append({
+                    "工作表": sheet_name,
+                    "值字段": field,
+                    "分组字段": " / ".join(gf_current) if gf_current else "无分组",
+                    "导出行数": len(final_df),
+                    "有效数量": valid_count,
+                    "面积统计": "是" if need_area else "否",
+                    "小计行": "是" if need_sub and gf_current else "否",
+                })
 
+                thin = Side(border_style='thin', color='000000')
+                bd = Border(thin, thin, thin, thin)
 
                 if gf_current:
                     start_row = 2
                     row_count = len(final_df)
-                    thin = Side(border_style='thin', color='000000')
-                    bd = Border(thin, thin, thin, thin)
 
                     # 1) 垂直合并：每一级分类列不跨“小计” nor “总计”
                     for ci in range(len(gf_current)):
@@ -1244,36 +1724,38 @@ class HorizontalApp:
                             elif isinstance(cell.value, float):
                                 cell.number_format = "0.00"
 
+            self._write_export_overview(writer, out, overview_rows)
+
+        if not overview_rows:
+            if os.path.exists(out):
+                os.remove(out)
+            messagebox.showerror("错误", "没有找到可用于统计的数值数据。")
+            return self._hide_progress("就绪")
+
+        if skipped:
+            skipped_text = "\n".join(
+                f"- 值字段 {field} / 分组 {' / '.join(groups) if groups else '无分组'}"
+                for field, groups in skipped[:8]
+            )
+            messagebox.showwarning("部分组合已跳过", f"以下组合没有有效数值，已自动跳过：\n{skipped_text}")
+
         elapsed = round2(time.time() - start)
         self._hide_progress(f"完成:{elapsed}s")
         self.show_result_dialog(out, elapsed)
 
 
-    def _subtotal(self, fl, gf, val, ratio, total_n, total_area, need_area):
+    def _subtotal(self, fl, df_source, gf, val, ratio, need_area):
         row = {gf[0]: f"{fl} 合计"} if gf else {}
         for lvl in (gf[1:] if len(gf)>1 else []):
             row[lvl] = ""
-        df0 = self.data[self.data[gf[0]] == fl] if gf else self.data
-        cnt = df0[val].count()
-        mean, med = df0[val].mean(), df0[val].median()
-        mx, mn, std = df0[val].max(), df0[val].min(), df0[val].std()
-        cv = std/mean if mean else np.nan
-        pct = (cnt/total_n*100) if total_n else np.nan
-        vals = {
-            "数量": cnt,
-            "平均值": round2(mean),
-            "中位值": round2(med),
-            "最大值": round2(mx),
-            "最小值": round2(mn),
-            "标准差": round2(std),
-            "变异系数": round2(cv),
-            "数量占比": round2(pct),
-            "合计": round2(df0[val].sum())
-        }
+        df0 = df_source[df_source[gf[0]] == fl] if gf else df_source
+        vals = calculate_series_stats(df0[val], int(df_source[val].count()))
+        vals = apply_count_masks(pd.DataFrame([vals])).iloc[0].to_dict()
         for stat in self.last_stats:
             row[stat] = vals.get(stat, "")
         if need_area:
             a0 = df0[ratio].sum()
+            total_area = df_source[ratio].sum()
             ap = (a0 / total_area * 100) if total_area else np.nan
 
             # 面积用用户小数位
@@ -1308,9 +1790,10 @@ class HorizontalApp:
               .to_excel(f"{i}.xlsx", index=False)
         self.status_var.set("彩蛋完成")
     def show_result_dialog(self, filepath, elapsed):
+        mark_output(self, filepath)
         dlg = tk.Toplevel(self.root)
         dlg.title("完成")
-        dlg.geometry("450x150")
+        dlg.geometry("620x190")
         dlg.resizable(False, False)
 
         msg = f"已导出文件：\n{filepath}\n\n耗时 {elapsed} 秒"
@@ -1324,9 +1807,15 @@ class HorizontalApp:
         ttk.Button(frm, text="预览",
                    command=lambda: self.open_preview(filepath))\
             .grid(row=0, column=1, padx=6)
+        ttk.Button(frm, text="打开文件夹",
+                   command=lambda: open_output_folder(self))\
+            .grid(row=0, column=2, padx=6)
+        ttk.Button(frm, text="复制路径",
+                   command=lambda: copy_text(self, filepath, "导出路径已复制"))\
+            .grid(row=0, column=3, padx=6)
         ttk.Button(frm, text="关闭",
                    command=dlg.destroy)\
-            .grid(row=0, column=2, padx=6)
+            .grid(row=0, column=4, padx=6)
 
         dlg.grab_set()
 

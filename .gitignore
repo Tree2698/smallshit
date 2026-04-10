@@ -5,6 +5,7 @@ __pycache__/
 # Runtime config
 small_shit.json
 small_shit_vertical.json
+app_preferences.json
 
 # Exported result files
 *_结果.xlsx
@@ -14,4 +15,3 @@ small_shit_vertical.json
 build/
 dist/
 *.spec
-
