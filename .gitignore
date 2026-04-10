@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.log
+
+# Runtime config
+small_shit.json
+small_shit_vertical.json
+
+# Exported result files
+*_结果.xlsx
+*_计算小捞翔后.xlsx
+
+# Packaging output
+build/
+dist/
+*.spec
+
