@@ -51,6 +51,15 @@ STD_MASK_STATS = {"标准差", "方差", "变异系数"}
 SHAPE_MASK_STATS = {"偏度", "峰度"}
 
 
+AREA_UNIT_FACTORS = {
+    "平方米": 1.0,
+    "亩": 666.6666666667,
+    "公顷": 10000.0,
+    "平方千米": 1000000.0,
+}
+AREA_UNITS = list(AREA_UNIT_FACTORS.keys())
+
+
 def sort_key(value: Any) -> tuple[str, int | float]:
     """生成适合中文排序的 key（拼音 + 笔画）。"""
     text = str(value).strip()
@@ -101,6 +110,56 @@ def read_csv_safely(path: str, **kwargs: Any) -> pd.DataFrame:
 
     detail = "\\n".join(errors) if errors else "未捕获到具体编码错误。"
     raise ValueError(f"无法识别 CSV 编码，可尝试另存为 UTF-8 后再导入。\\n{detail}")
+
+
+
+
+def normalize_area_unit(unit: Any) -> str:
+    """规范化面积单位名称。"""
+    aliases = {
+        "m2": "平方米",
+        "㎡": "平方米",
+        "平方公尺": "平方米",
+        "mu": "亩",
+        "ha": "公顷",
+        "hm2": "公顷",
+        "hm²": "公顷",
+        "km2": "平方千米",
+        "km²": "平方千米",
+        "平方公里": "平方千米",
+    }
+    text = str(unit or "").strip()
+    if text in AREA_UNIT_FACTORS:
+        return text
+    return aliases.get(text.lower(), "亩")
+
+
+def get_area_column_name(unit: Any) -> str:
+    """按目标单位生成面积列名。"""
+    normalized = normalize_area_unit(unit)
+    return f"面积（{normalized}）"
+
+
+def convert_area_value(value: Any, from_unit: Any, to_unit: Any) -> Any:
+    """将面积值从一个单位换算到另一个单位。"""
+    from_name = normalize_area_unit(from_unit)
+    to_name = normalize_area_unit(to_unit)
+    try:
+        numeric = float(value)
+    except Exception:
+        return value
+    square_meters = numeric * AREA_UNIT_FACTORS[from_name]
+    return square_meters / AREA_UNIT_FACTORS[to_name]
+
+
+def convert_area_series(series: pd.Series, from_unit: Any, to_unit: Any) -> pd.Series:
+    """批量换算面积序列。"""
+    from_name = normalize_area_unit(from_unit)
+    to_name = normalize_area_unit(to_unit)
+    if from_name == to_name:
+        return pd.to_numeric(series, errors="coerce")
+    numeric = pd.to_numeric(series, errors="coerce")
+    return numeric * AREA_UNIT_FACTORS[from_name] / AREA_UNIT_FACTORS[to_name]
 
 
 def calculate_series_stats(series: pd.Series, total_valid_count: int | None = None) -> dict[str, Any]:

@@ -19,8 +19,11 @@ from common_utils import (
     apply_filter_conditions,
     apply_count_masks,
     build_grouped_stats_frame,
+    AREA_UNITS,
     calculate_series_stats,
+    convert_area_series,
     describe_filter_conditions,
+    get_area_column_name,
     open_with_default_app,
     read_csv_safely,
     round2,
@@ -148,14 +151,30 @@ class HorizontalApp:
                         command=self.toggle_area_fields) \
             .grid(row=1, column=2, padx=6)
 
-        # 新增：面积小数位选择
-        ttk.Label(frm2, text="面积小数位:").grid(row=2, column=0, pady=(4, 0))
+        # 面积换算与小数位
+        ttk.Label(frm2, text="面积当前单位:").grid(row=2, column=0, pady=(4, 0))
+        self.area_source_unit_var = tk.StringVar(value="亩")
+        self.area_source_unit_menu = ttk.Combobox(
+            frm2, textvariable=self.area_source_unit_var,
+            state="readonly", width=12, values=AREA_UNITS
+        )
+        self.area_source_unit_menu.grid(row=2, column=1, sticky='w')
+
+        ttk.Label(frm2, text="换算为:").grid(row=2, column=2, padx=(12, 0), sticky='w')
+        self.area_target_unit_var = tk.StringVar(value="亩")
+        self.area_target_unit_menu = ttk.Combobox(
+            frm2, textvariable=self.area_target_unit_var,
+            state="readonly", width=12, values=AREA_UNITS
+        )
+        self.area_target_unit_menu.grid(row=2, column=3, sticky='w')
+
+        ttk.Label(frm2, text="面积小数位:").grid(row=3, column=0, pady=(4, 0))
         self.area_decimals_var = tk.IntVar(value=2)
         self.area_decimals_spin = ttk.Spinbox(
             frm2, from_=0, to=10, textvariable=self.area_decimals_var,
             width=5, state="readonly"
         )
-        self.area_decimals_spin.grid(row=2, column=1, sticky='w')
+        self.area_decimals_spin.grid(row=3, column=1, sticky='w')
 
         sep()
 
@@ -315,6 +334,8 @@ class HorizontalApp:
             "shown_version": getattr(self, "shown_version", ""),
             "update_history": getattr(self, "update_history", []),
             "area_decimals": self.area_decimals_var.get(),
+            "area_source_unit": self.area_source_unit_var.get(),
+            "area_target_unit": self.area_target_unit_var.get(),
             "ui_state": self._collect_ui_state(),
             "filter_conditions": self.filter_conditions,
             "group_templates": self.group_templates,
@@ -365,6 +386,8 @@ class HorizontalApp:
             # 面积小数位：默认为已有控件的当前值
             dec = cfg.get("area_decimals", self.area_decimals_var.get())
             self.area_decimals_var.set(dec)
+            self.area_source_unit_var.set(str(cfg.get("area_source_unit", self.area_source_unit_var.get()) or "亩"))
+            self.area_target_unit_var.set(str(cfg.get("area_target_unit", self.area_target_unit_var.get()) or "亩"))
             self.saved_ui_state = cfg.get("ui_state", {})
             self.filter_conditions = cfg.get("filter_conditions", [])
             self.group_templates = cfg.get("group_templates", {})
@@ -386,6 +409,8 @@ class HorizontalApp:
             "ratio_field": self.ratio_var.get(),
             "value_enabled": bool(self.val_enable_var.get()),
             "area_enabled": bool(self.area_cb.get()),
+            "area_source_unit": self.area_source_unit_var.get(),
+            "area_target_unit": self.area_target_unit_var.get(),
             "batch_enabled": bool(self.batch_var.get()),
             "batch_fields": list(self.batch_fields),
             "group_batch_enabled": bool(self.group_batch_var.get()),
@@ -427,6 +452,8 @@ class HorizontalApp:
             self.val_var.set(saved_value)
 
         self.area_cb.set(bool(state.get("area_enabled", self.area_cb.get())))
+        self.area_source_unit_var.set(str(state.get("area_source_unit", self.area_source_unit_var.get()) or "亩"))
+        self.area_target_unit_var.set(str(state.get("area_target_unit", self.area_target_unit_var.get()) or "亩"))
         self.toggle_area_fields()
         if self.area_cb.get() and saved_ratio in cols:
             self.ratio_var.set(saved_ratio)
@@ -512,6 +539,7 @@ class HorizontalApp:
             f"分类级别：{' / '.join(state.get('levels', [])) or '未设置'}",
             f"值字段：{state.get('value_field') or '未设置'}",
             f"面积字段：{state.get('ratio_field') or '未设置'}",
+            f"面积单位：{state.get('area_source_unit', '亩')} → {state.get('area_target_unit', '亩')}",
             f"启用值字段：{'是' if state.get('value_enabled', True) else '否'}",
             f"面积统计：{'是' if state.get('area_enabled', False) else '否'}",
             f"批量值字段：{' / '.join(state.get('batch_fields', [])) or '未启用'}",
@@ -1159,10 +1187,11 @@ class HorizontalApp:
         stats_map["数量占比"] = round2(100.0)
         if need_area:
             total_area = df[ratio].sum()
+            area_col = self._get_area_column_name()
 
             dec = self.area_decimals_var.get()
             fmt = "0" if dec == 0 else "0." + "0" * dec
-            stats_map["面积(亩)"] = float(Decimal(str(total_area))
+            stats_map[area_col] = float(Decimal(str(total_area))
                                           .quantize(Decimal(fmt), ROUND_HALF_UP))
             stats_map["面积占比"] = round2(100.0)
 
@@ -1189,7 +1218,7 @@ class HorizontalApp:
         for column in df.columns:
             if column in group_fields or column in {"数量", "缺失数"}:
                 continue
-            if column == "面积(亩)" and need_area:
+            if column == self._get_area_column_name() and need_area:
                 df[column] = df[column].apply(lambda value: round_dec(value, dec))
             else:
                 df[column] = df[column].apply(round2)
@@ -1209,6 +1238,7 @@ class HorizontalApp:
             {"项目": "统计量", "内容": "、".join(self.last_stats)},
             {"项目": "插入小计行", "内容": "是" if self.subtotal_var.get() else "否"},
             {"项目": "面积统计", "内容": "是" if self.area_cb.get() else "否"},
+            {"项目": "面积换算", "内容": self._get_area_units_text() if self.area_cb.get() else "未启用"},
             {"项目": "筛选条件", "内容": describe_filter_conditions(active_filters)},
             {"项目": "当前模板", "内容": self.active_group_template_name or "未使用"},
             {"项目": "批量值字段", "内容": "、".join(self.batch_fields) if self.batch_fields else "未启用"},
@@ -1218,15 +1248,40 @@ class HorizontalApp:
         if overview_rows:
             pd.DataFrame(overview_rows).to_excel(writer, index=False, sheet_name="导出清单")
 
+    def _get_area_column_name(self):
+        return get_area_column_name(self.area_target_unit_var.get())
+
+    def _get_area_units_text(self):
+        return f"{self.area_source_unit_var.get()} → {self.area_target_unit_var.get()}"
+
+    def _resolve_value_fields(self, need_area):
+        batch_fields = [field for field in getattr(self, "batch_fields", []) if field]
+        if self.batch_var.get() and batch_fields:
+            return batch_fields
+
+        value_field = self.val_var.get().strip()
+        if self.val_enable_var.get() and value_field:
+            return [value_field]
+
+        ratio_field = self.ratio_var.get().strip()
+        if need_area and ratio_field:
+            return [ratio_field]
+
+        return []
+
     # 文件 & 数据加载
     def toggle_area_fields(self):
         if self.area_cb.get():
             self.ratio_menu.state(["!disabled"])
             self.area_decimals_spin.state(["!disabled"])
+            self.area_source_unit_menu.state(["!disabled"])
+            self.area_target_unit_menu.state(["!disabled"])
         else:
             self.ratio_menu.state(["disabled"])
             self.ratio_var.set("")
             self.area_decimals_spin.state(["disabled"])
+            self.area_source_unit_menu.state(["disabled"])
+            self.area_target_unit_menu.state(["disabled"])
 
     def toggle_value_field(self):
         """控制值字段下拉和批量值字段复选框的启用/禁用"""
@@ -1468,10 +1523,13 @@ class HorizontalApp:
 
         # 默认分类级别
         gf = [l["var"].get() for l in self.levels if l["var"].get()]
-        if self.batch_var.get() and getattr(self, "batch_fields", None):
-            fields = self.batch_fields or [self.val_var.get()]
-        else:
-            fields = [self.val_var.get()]
+        need_area = self.area_cb.get()
+        ratio = self.ratio_var.get().strip()
+        if need_area and not ratio:
+            messagebox.showerror("错误", "已启用面积统计，但尚未选择面积字段。")
+            return self._hide_progress("就绪")
+
+        fields = self._resolve_value_fields(need_area)
 
         # 批量分组字段
         groups = []
@@ -1479,12 +1537,8 @@ class HorizontalApp:
             groups = self.group_batch_fields
 
         # 先取到当前是否开启批量值字段 / 批量分组
-        batch_on = self.batch_var.get()
+        batch_on = self.batch_var.get() and bool([field for field in getattr(self, "batch_fields", []) if field])
         group_on = self.group_batch_var.get()
-
-        # 取出 fields, groups
-        if batch_on and getattr(self, "batch_fields", None):
-            fields = self.batch_fields or fields
 
         groups = []
         if group_on and getattr(self, "group_batch_fields", None):
@@ -1515,16 +1569,15 @@ class HorizontalApp:
 
         elif group_on:
             # 只有批量分组字段
-            loops = [(self.val_var.get(), [g]) for g in groups]
+            loops = [(fields[0], [g]) for g in groups] if fields else []
 
         else:
             # 都没批量
-            loops = [(self.val_var.get(),
-                      [l["var"].get() for l in self.levels if l["var"].get()])]
+            loops = [(fields[0],
+                      [l["var"].get() for l in self.levels if l["var"].get()])] if fields else []
 
-        ratio = self.ratio_var.get()
-        need_area = self.area_cb.get()
         need_sub = bool(self.subtotal_var.get())
+        area_col = self._get_area_column_name()
 
         basename = os.path.splitext(os.path.basename(self.excel_path))[0]
         out = build_output_path(self, f"{basename}_结果")
@@ -1538,9 +1591,12 @@ class HorizontalApp:
         skipped = []
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
             for field, gf_current in loops:
-                self.status_var.set(f"计算: 值字段={field}, 分组={gf_current}")
+                display_field = field if (self.val_enable_var.get() or field != ratio) else f"面积字段({ratio})"
+                self.status_var.set(f"计算: 值字段={display_field}, 分组={gf_current}")
 
                 df0 = active_df.copy()
+                if need_area:
+                    df0[ratio] = convert_area_series(df0[ratio], self.area_source_unit_var.get(), self.area_target_unit_var.get())
                 df0[field] = pd.to_numeric(df0[field], errors="coerce")
                 valid_count = int(df0[field].count())
                 if valid_count == 0:
@@ -1549,7 +1605,6 @@ class HorizontalApp:
 
                 # 仅在需要面积占比时才处理 ratio 列
                 if need_area:
-                    df0[ratio] = pd.to_numeric(df0[ratio], errors="coerce")
                     area_total = df0[ratio].sum()
                 else:
                     area_total = None
@@ -1558,13 +1613,13 @@ class HorizontalApp:
 
                 if need_area:
                     if gf_current:
-                        area_df = df0.groupby(gf_current, dropna=False)[ratio].sum().reset_index(name="面积(亩)")
+                        area_df = df0.groupby(gf_current, dropna=False)[ratio].sum().reset_index(name=area_col)
                         res = res.merge(area_df, on=gf_current, how="left")
-                        total_area = res["面积(亩)"].sum()
+                        total_area = res[area_col].sum()
                     else:
                         total_area = float(area_total) if area_total is not None else 0.0
-                        res["面积(亩)"] = total_area
-                    res["面积占比"] = (res["面积(亩)"] / total_area * 100) if total_area else np.nan
+                        res[area_col] = total_area
+                    res["面积占比"] = (res[area_col] / total_area * 100) if total_area else np.nan
 
                 res = self._round_result_frame(res, gf_current, need_area)
                 filtered = apply_count_masks(res)
@@ -1572,7 +1627,7 @@ class HorizontalApp:
                 # 列切片
                 display_cols = gf_current + self.last_stats.copy()
                 if need_area:
-                    display_cols += ["面积(亩)", "面积占比"]
+                    display_cols += [area_col, "面积占比"]
                 tmp = filtered[display_cols].copy()
 
                 # —— 多级稳定排序 ——
@@ -1643,7 +1698,7 @@ class HorizontalApp:
                 ws = writer.sheets[sheet_name]
                 overview_rows.append({
                     "工作表": sheet_name,
-                    "值字段": field,
+                    "值字段": display_field,
                     "分组字段": " / ".join(gf_current) if gf_current else "无分组",
                     "导出行数": len(final_df),
                     "有效数量": valid_count,
@@ -1728,7 +1783,7 @@ class HorizontalApp:
                             continue
 
                         col_name = col_idx_to_name.get(col_idx, "")
-                        if col_name == "面积(亩)" and isinstance(cell.value, (int, float)):
+                        if col_name == area_col and isinstance(cell.value, (int, float)):
                             # 面积列按用户设置小数位
                             cell.number_format = area_fmt
                         elif col_name == "面积占比" and isinstance(cell.value, (int, float)):
@@ -1778,7 +1833,7 @@ class HorizontalApp:
             # 面积用用户小数位
             dec = self.area_decimals_var.get()
             fmt = "0" if dec == 0 else "0." + "0" * dec
-            row["面积(亩)"] = float(Decimal(str(a0))
+            row[self._get_area_column_name()] = float(Decimal(str(a0))
                                     .quantize(Decimal(fmt), ROUND_HALF_UP))
             # 面积占比仍两位
             row["面积占比"] = round2(ap)
