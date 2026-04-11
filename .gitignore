@@ -1,9 +1,8 @@
+.venv/
+dist/
+build/
 __pycache__/
 *.pyc
-.venv/
-build/
-dist/
-*.spec.bak
 small_shit.json
 small_shit_vertical.json
 app_preferences.json
