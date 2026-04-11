@@ -14,20 +14,36 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinterdnd2 import DND_FILES
 
 from common_utils import (
-    EXTENDED_STATS,
     FILTER_OPERATORS,
     apply_filter_conditions,
     apply_count_masks,
+    area_column_name,
     build_grouped_stats_frame,
-    AREA_UNITS,
-    calculate_series_stats,
+    add_chart_sheet_from_frame,
     convert_area_series,
     describe_filter_conditions,
-    get_area_column_name,
+    friendly_error_message,
+    get_extended_stats_with_plugins,
+    load_stat_plugins,
     open_with_default_app,
     read_csv_safely,
     round2,
     sort_key,
+)
+from feature_support import (
+    apply_advanced_state,
+    capture_task_snapshot,
+    collect_advanced_state,
+    ensure_advanced_state,
+    get_active_data_generic,
+    get_filtered_data_generic,
+    open_filter_builder_generic,
+    prepare_loaded_dataframe,
+    publish_output_bundle,
+    rebuild_dataframe,
+    refresh_controls_with_dataframe,
+    show_exception_dialog,
+    update_loaded_status_generic,
 )
 from ui_shell import (
     bind_shortcuts,
@@ -40,20 +56,35 @@ from ui_shell import (
     open_output_folder,
     populate_recent_menus,
     set_status,
-    show_workbook_preview,
 )
 
 # 当前程序版本号——每次发布时请手动更新
-APP_VERSION = "1.2.0"
+APP_VERSION = "2.0.3"
 
 UPDATE_CONTENT = """
-小捞翔·至尊版 v1.2.0 更新日志：
-- 新增：扩展统计指标，支持缺失数、缺失率、四分位数、极差、方差、偏度、峰度等
-- 新增：横版支持“插入小计行”开关，统计项里的“合计”现在会作为求和列正常导出
-- 新增：自动生成“统计说明”和“导出清单”工作表，方便回看参数和输出内容
-- 新增：值字段会自动尝试转为数值，无法计算的组合会提示并自动跳过
-- 优化：横版和竖版统计口径统一，更多统计方法在两个界面保持一致
-- 优化：统计量选择面板扩大，容纳更多指标
+小捞翔·至尊版 v2.0.3 更新日志：
+- 修复：源码运行与打包后切换到竖版时可能找不到模块的问题
+- 修复：竖版统计说明页里的面积换算 f-string 语法错误
+- 修复：横版条件筛选缺少导入导致 apply_filter_conditions / describe_filter_conditions 未定义
+- 修复：导出格式与小计展示的若干兼容问题
+- 修复：未启用值字段、仅启用面积字段时会报错的问题
+- 新增：面积单位换算，支持平方米、亩、公顷、平方千米之间自动换算
+- 新增：导出面积列名会根据目标单位自动显示为“面积（单位）”
+- 新增：面积单位设置会保存到本地配置
+- 新增：统计图表导出
+- 新增：筛选方案保存与加载
+- 新增：批量任务中心
+- 新增：多文件合并统计
+- 新增：字段智能推荐
+- 新增：日期类统计
+- 新增：分组映射与区间分组
+- 新增：增强预览模式
+- 优化：错误提示更加友好，减少直接抛出技术性报错
+- 新增：工作区管理
+- 新增：导出发布链路
+- 新增：插件化统计指标能力
+- 新增：操作历史与撤销功能
+- 优化：README 与程序功能说明同步更新
 """
 
 
@@ -87,13 +118,15 @@ class HorizontalApp:
         self.custom_orders = {}    # 用户确认后的自定义顺序
         self.original_orders = {}
         self.data = pd.DataFrame()
-        self.all_stats = EXTENDED_STATS.copy()
+        self.plugin_stats = load_stat_plugins()
+        self.all_stats = get_extended_stats_with_plugins(self.plugin_stats)
         self.last_stats = self.all_stats.copy()
         self.batch_fields = []
         self.group_batch_fields = []
         self.filter_conditions = []
         self.group_templates = {}
         self.active_group_template_name = ""
+        ensure_advanced_state(self)
 
         # 文件 & Sheet 选择
         frm = ttk.Frame(root); frm.pack(fill='x', padx=12, pady=6)
@@ -151,30 +184,14 @@ class HorizontalApp:
                         command=self.toggle_area_fields) \
             .grid(row=1, column=2, padx=6)
 
-        # 面积换算与小数位
-        ttk.Label(frm2, text="面积当前单位:").grid(row=2, column=0, pady=(4, 0))
-        self.area_source_unit_var = tk.StringVar(value="亩")
-        self.area_source_unit_menu = ttk.Combobox(
-            frm2, textvariable=self.area_source_unit_var,
-            state="readonly", width=12, values=AREA_UNITS
-        )
-        self.area_source_unit_menu.grid(row=2, column=1, sticky='w')
-
-        ttk.Label(frm2, text="换算为:").grid(row=2, column=2, padx=(12, 0), sticky='w')
-        self.area_target_unit_var = tk.StringVar(value="亩")
-        self.area_target_unit_menu = ttk.Combobox(
-            frm2, textvariable=self.area_target_unit_var,
-            state="readonly", width=12, values=AREA_UNITS
-        )
-        self.area_target_unit_menu.grid(row=2, column=3, sticky='w')
-
-        ttk.Label(frm2, text="面积小数位:").grid(row=3, column=0, pady=(4, 0))
+        # 新增：面积小数位选择
+        ttk.Label(frm2, text="面积小数位:").grid(row=2, column=0, pady=(4, 0))
         self.area_decimals_var = tk.IntVar(value=2)
         self.area_decimals_spin = ttk.Spinbox(
             frm2, from_=0, to=10, textvariable=self.area_decimals_var,
             width=5, state="readonly"
         )
-        self.area_decimals_spin.grid(row=3, column=1, sticky='w')
+        self.area_decimals_spin.grid(row=2, column=1, sticky='w')
 
         sep()
 
@@ -334,13 +351,11 @@ class HorizontalApp:
             "shown_version": getattr(self, "shown_version", ""),
             "update_history": getattr(self, "update_history", []),
             "area_decimals": self.area_decimals_var.get(),
-            "area_source_unit": self.area_source_unit_var.get(),
-            "area_target_unit": self.area_target_unit_var.get(),
             "ui_state": self._collect_ui_state(),
             "filter_conditions": self.filter_conditions,
             "group_templates": self.group_templates,
             "active_group_template_name": self.active_group_template_name,
-            "last_output_path": self.last_output_path,
+            "advanced_state": collect_advanced_state(self),
         }
         cfg_path = path or CONFIG_FILE
         try:
@@ -386,13 +401,11 @@ class HorizontalApp:
             # 面积小数位：默认为已有控件的当前值
             dec = cfg.get("area_decimals", self.area_decimals_var.get())
             self.area_decimals_var.set(dec)
-            self.area_source_unit_var.set(str(cfg.get("area_source_unit", self.area_source_unit_var.get()) or "亩"))
-            self.area_target_unit_var.set(str(cfg.get("area_target_unit", self.area_target_unit_var.get()) or "亩"))
             self.saved_ui_state = cfg.get("ui_state", {})
             self.filter_conditions = cfg.get("filter_conditions", [])
             self.group_templates = cfg.get("group_templates", {})
             self.active_group_template_name = cfg.get("active_group_template_name", "")
-            self.last_output_path = cfg.get("last_output_path")
+            apply_advanced_state(self, cfg.get("advanced_state", {}))
 
         except Exception as e:
             messagebox.showerror("加载失败", str(e))
@@ -409,13 +422,14 @@ class HorizontalApp:
             "ratio_field": self.ratio_var.get(),
             "value_enabled": bool(self.val_enable_var.get()),
             "area_enabled": bool(self.area_cb.get()),
-            "area_source_unit": self.area_source_unit_var.get(),
-            "area_target_unit": self.area_target_unit_var.get(),
             "batch_enabled": bool(self.batch_var.get()),
             "batch_fields": list(self.batch_fields),
             "group_batch_enabled": bool(self.group_batch_var.get()),
             "group_batch_fields": list(self.group_batch_fields),
             "subtotal_enabled": bool(self.subtotal_var.get()),
+            "area_source_unit": getattr(self, "area_source_unit", "平方米"),
+            "area_target_unit": getattr(self, "area_target_unit", "亩"),
+            "export_charts": bool(getattr(self, "export_charts", True)),
         }
 
     def _set_level_count(self, target_count):
@@ -452,8 +466,6 @@ class HorizontalApp:
             self.val_var.set(saved_value)
 
         self.area_cb.set(bool(state.get("area_enabled", self.area_cb.get())))
-        self.area_source_unit_var.set(str(state.get("area_source_unit", self.area_source_unit_var.get()) or "亩"))
-        self.area_target_unit_var.set(str(state.get("area_target_unit", self.area_target_unit_var.get()) or "亩"))
         self.toggle_area_fields()
         if self.area_cb.get() and saved_ratio in cols:
             self.ratio_var.set(saved_ratio)
@@ -466,6 +478,9 @@ class HorizontalApp:
         self.toggle_group_batch()
         self.group_batch_fields = [field for field in state.get("group_batch_fields", []) if field in cols]
         self.subtotal_var.set(bool(state.get("subtotal_enabled", self.subtotal_var.get())))
+        self.area_source_unit = state.get("area_source_unit", getattr(self, "area_source_unit", "平方米"))
+        self.area_target_unit = state.get("area_target_unit", getattr(self, "area_target_unit", "亩"))
+        self.export_charts = bool(state.get("export_charts", getattr(self, "export_charts", True)))
 
     def _normalize_filter_conditions(self, cols):
         normalized = []
@@ -539,7 +554,6 @@ class HorizontalApp:
             f"分类级别：{' / '.join(state.get('levels', [])) or '未设置'}",
             f"值字段：{state.get('value_field') or '未设置'}",
             f"面积字段：{state.get('ratio_field') or '未设置'}",
-            f"面积单位：{state.get('area_source_unit', '亩')} → {state.get('area_target_unit', '亩')}",
             f"启用值字段：{'是' if state.get('value_enabled', True) else '否'}",
             f"面积统计：{'是' if state.get('area_enabled', False) else '否'}",
             f"批量值字段：{' / '.join(state.get('batch_fields', [])) or '未启用'}",
@@ -1182,17 +1196,12 @@ class HorizontalApp:
         self.root.wait_window(dlg)
 
     # 整表总计行
-    def _append_overall_total(self, final, df, gf, val, ratio, need_area):
-        stats_map = calculate_series_stats(df[val], int(pd.to_numeric(df[val], errors="coerce").count()))
+    def _append_overall_total(self, final, df, gf, val, ratio, need_area, area_col=None):
+        stats_map = build_grouped_stats_frame(df, val, [], self.plugin_stats).iloc[0].to_dict()
         stats_map["数量占比"] = round2(100.0)
-        if need_area:
-            total_area = df[ratio].sum()
-            area_col = self._get_area_column_name()
-
-            dec = self.area_decimals_var.get()
-            fmt = "0" if dec == 0 else "0." + "0" * dec
-            stats_map[area_col] = float(Decimal(str(total_area))
-                                          .quantize(Decimal(fmt), ROUND_HALF_UP))
+        if need_area and area_col and ratio in df.columns:
+            total_area = pd.to_numeric(df[ratio], errors="coerce").sum()
+            stats_map[area_col] = round2(total_area)
             stats_map["面积占比"] = round2(100.0)
 
         total_row = {}
@@ -1205,42 +1214,31 @@ class HorizontalApp:
         overall_df = pd.DataFrame([total_row], columns=final.columns)
         return pd.concat([final, overall_df], ignore_index=True)
 
-    def _round_result_frame(self, df, group_fields, need_area):
+    def _round_result_frame(self, df, group_fields, need_area, area_col=None):
         dec = self.area_decimals_var.get()
-
-        def round_dec(value, digits):
-            try:
-                fmt = "0" if digits == 0 else "0." + "0" * digits
-                return float(Decimal(str(value)).quantize(Decimal(fmt), ROUND_HALF_UP))
-            except Exception:
-                return value
-
         for column in df.columns:
             if column in group_fields or column in {"数量", "缺失数"}:
                 continue
-            if column == self._get_area_column_name() and need_area:
-                df[column] = df[column].apply(lambda value: round_dec(value, dec))
+            if need_area and area_col and column == area_col:
+                df[column] = df[column].apply(lambda value: round2(value) if dec == 2 else value if pd.isna(value) else round(float(value), dec))
             else:
                 df[column] = df[column].apply(round2)
         return df
 
     def _write_export_overview(self, writer, output_path, overview_rows):
-        active_filters = [c for c in self.filter_conditions if c.get("enabled", True)]
-        filtered_rows = len(self.get_active_data()) if hasattr(self, "get_active_data") else len(self.data)
         summary_rows = [
             {"项目": "导出时间", "内容": time.strftime("%Y-%m-%d %H:%M:%S")},
             {"项目": "模式", "内容": self.mode_label},
             {"项目": "源文件", "内容": self.excel_path},
             {"项目": "数据源", "内容": self.current_sheet_name or "当前数据"},
-            {"项目": "原始记录数", "内容": len(self.data)},
-            {"项目": "导出记录数", "内容": filtered_rows},
             {"项目": "导出文件", "内容": output_path},
             {"项目": "统计量", "内容": "、".join(self.last_stats)},
             {"项目": "插入小计行", "内容": "是" if self.subtotal_var.get() else "否"},
             {"项目": "面积统计", "内容": "是" if self.area_cb.get() else "否"},
-            {"项目": "面积换算", "内容": self._get_area_units_text() if self.area_cb.get() else "未启用"},
-            {"项目": "筛选条件", "内容": describe_filter_conditions(active_filters)},
-            {"项目": "当前模板", "内容": self.active_group_template_name or "未使用"},
+            {"项目": "面积换算", "内容": f"{getattr(self, 'area_source_unit', '平方米')} -> {getattr(self, 'area_target_unit', '亩')}"},
+            {"项目": "导出图表", "内容": "是" if getattr(self, 'export_charts', True) else "否"},
+            {"项目": "筛选条件", "内容": describe_filter_conditions(getattr(self, 'filter_conditions', []))},
+            {"项目": "分组模板", "内容": self.active_group_template_name or "未使用"},
             {"项目": "批量值字段", "内容": "、".join(self.batch_fields) if self.batch_fields else "未启用"},
             {"项目": "批量分组字段", "内容": "、".join(self.group_batch_fields) if self.group_batch_fields else "未启用"},
         ]
@@ -1248,40 +1246,15 @@ class HorizontalApp:
         if overview_rows:
             pd.DataFrame(overview_rows).to_excel(writer, index=False, sheet_name="导出清单")
 
-    def _get_area_column_name(self):
-        return get_area_column_name(self.area_target_unit_var.get())
-
-    def _get_area_units_text(self):
-        return f"{self.area_source_unit_var.get()} → {self.area_target_unit_var.get()}"
-
-    def _resolve_value_fields(self, need_area):
-        batch_fields = [field for field in getattr(self, "batch_fields", []) if field]
-        if self.batch_var.get() and batch_fields:
-            return batch_fields
-
-        value_field = self.val_var.get().strip()
-        if self.val_enable_var.get() and value_field:
-            return [value_field]
-
-        ratio_field = self.ratio_var.get().strip()
-        if need_area and ratio_field:
-            return [ratio_field]
-
-        return []
-
     # 文件 & 数据加载
     def toggle_area_fields(self):
         if self.area_cb.get():
             self.ratio_menu.state(["!disabled"])
             self.area_decimals_spin.state(["!disabled"])
-            self.area_source_unit_menu.state(["!disabled"])
-            self.area_target_unit_menu.state(["!disabled"])
         else:
             self.ratio_menu.state(["disabled"])
             self.ratio_var.set("")
             self.area_decimals_spin.state(["disabled"])
-            self.area_source_unit_menu.state(["disabled"])
-            self.area_target_unit_menu.state(["disabled"])
 
     def toggle_value_field(self):
         """控制值字段下拉和批量值字段复选框的启用/禁用"""
@@ -1369,11 +1342,11 @@ class HorizontalApp:
 
     def _on_data(self, df):
         self._hide_progress()
-        self.data = df
         ext = os.path.splitext(self.excel_path)[1].lower()
         self.current_sheet_name = "CSV" if ext == ".csv" else (self.sheet_var.get() or "当前子表")
+        self.data = prepare_loaded_dataframe(self, df)
 
-        cols = list(df.columns)
+        cols = list(self.data.columns)
         for cmb in (self.val_menu, self.ratio_menu):
             cmb["values"] = cols
         if cols:
@@ -1381,7 +1354,6 @@ class HorizontalApp:
             self.ratio_var.set(cols[-1])
         self._refresh_levels(cols)
         self._restore_ui_state(cols)
-        self._normalize_filter_conditions(cols)
 
         if ext == ".csv":
             self.sheet_menu.set("")
@@ -1393,7 +1365,7 @@ class HorizontalApp:
 
         self.toggle_area_fields()
         self.calculate_btn.state(["!disabled"])
-        self._update_loaded_status()
+        update_loaded_status_generic(self)
 
     def _refresh_levels(self, cols):
         for lvl in self.levels:
@@ -1470,7 +1442,7 @@ class HorizontalApp:
             self._calculate()
         except Exception as ex:
             self.status_var.set(f"计算错误: {ex}")
-            messagebox.showerror("错误", traceback.format_exc())
+            show_exception_dialog(self, "计算失败", ex)
 
 
     def create_recent_menu(self):
@@ -1514,191 +1486,127 @@ class HorizontalApp:
             messagebox.showerror("错误", "请先加载数据")
             return self._hide_progress("就绪")
 
-        active_df = self._get_filtered_data(show_error=True)
-        if active_df is None:
-            return self._hide_progress("就绪")
-        if active_df.empty:
-            messagebox.showwarning("提示", "筛选后没有可用数据，请调整条件后再试。")
+        source_df = self.get_active_data().copy()
+        if source_df.empty:
+            messagebox.showwarning("提示", "筛选后没有可用于统计的数据。")
             return self._hide_progress("就绪")
 
-        # 默认分类级别
         gf = [l["var"].get() for l in self.levels if l["var"].get()]
-        need_area = self.area_cb.get()
-        ratio = self.ratio_var.get().strip()
-        if need_area and not ratio:
-            messagebox.showerror("错误", "已启用面积统计，但尚未选择面积字段。")
-            return self._hide_progress("就绪")
-
-        fields = self._resolve_value_fields(need_area)
-
-        # 批量分组字段
-        groups = []
-        if self.group_batch_var.get() and getattr(self, "group_batch_fields", None):
-            groups = self.group_batch_fields
-
-        # 先取到当前是否开启批量值字段 / 批量分组
-        batch_on = self.batch_var.get() and bool([field for field in getattr(self, "batch_fields", []) if field])
+        batch_on = self.batch_var.get()
         group_on = self.group_batch_var.get()
+        value_enabled = bool(self.val_enable_var.get())
+        need_area = bool(self.area_cb.get() and self.ratio_var.get())
+        ratio = self.ratio_var.get().strip()
+        need_sub = bool(self.subtotal_var.get())
+        area_col = area_column_name(getattr(self, "area_target_unit", "亩"))
 
-        groups = []
-        if group_on and getattr(self, "group_batch_fields", None):
-            groups = self.group_batch_fields or []
+        fields = []
+        if batch_on and getattr(self, "batch_fields", None):
+            fields = [field for field in self.batch_fields if field in source_df.columns]
+        elif value_enabled and self.val_var.get().strip():
+            fields = [self.val_var.get().strip()]
 
-        # --------- 这里替换原来的 loops 逻辑 ------------
+        if not fields and need_area and ratio:
+            fields = [ratio]
+
+        groups = self.group_batch_fields or [] if group_on else []
         loops = []
         if batch_on and group_on:
-            # 如果一一对应
             if len(fields) == len(groups):
                 loops = [(f, [g]) for f, g in zip(fields, groups)]
             else:
-                # 弹窗确认
-                cont = messagebox.askyesno(
-                    "提示",
-                    "所选值字段和分组字段数量不一致，\n"
-                    "是否按“所有值字段 × 所有分组字段”计算？"
-                )
-                if not cont:
-                    # 用户点“否”，就直接退出
-                    return self._hide_progress("就绪")
-                # 真正的笛卡尔积：所有 (f,g) 对
-                loops = [(f, [g]) for f, g in itertools.product(fields, groups)]
-
+                loops = [(f, [g]) for f in fields for g in groups]
         elif batch_on:
-            # 只有批量值字段
-            loops = [(f, self.levels and [l["var"].get() for l in self.levels if l["var"].get()] or []) for f in fields]
-
+            loops = [(f, gf) for f in fields]
         elif group_on:
-            # 只有批量分组字段
-            loops = [(fields[0], [g]) for g in groups] if fields else []
-
+            loops = [((fields[0] if fields else ratio), [g]) for g in groups]
         else:
-            # 都没批量
-            loops = [(fields[0],
-                      [l["var"].get() for l in self.levels if l["var"].get()])] if fields else []
+            loops = [((fields[0] if fields else ratio), gf)]
 
-        need_sub = bool(self.subtotal_var.get())
-        area_col = self._get_area_column_name()
-
-        basename = os.path.splitext(os.path.basename(self.excel_path))[0]
-        out = build_output_path(self, f"{basename}_结果")
-
-        # 如果没有任何可统计的(field, group)组合，提前退出
         if not loops:
             messagebox.showerror("错误", "没有可统计的值/分组组合，无法导出")
             return self._hide_progress("就绪")
 
+        basename = os.path.splitext(os.path.basename(self.excel_path))[0] if self.excel_path else "统计结果"
+        out = build_output_path(self, f"{basename}_结果")
         overview_rows = []
         skipped = []
+
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
             for field, gf_current in loops:
-                display_field = field if (self.val_enable_var.get() or field != ratio) else f"面积字段({ratio})"
-                self.status_var.set(f"计算: 值字段={display_field}, 分组={gf_current}")
-
-                df0 = active_df.copy()
-                if need_area:
-                    df0[ratio] = convert_area_series(df0[ratio], self.area_source_unit_var.get(), self.area_target_unit_var.get())
+                if not field or field not in source_df.columns:
+                    skipped.append((field or "<空值字段>", gf_current))
+                    continue
+                self.status_var.set(f"计算: 值字段={field}, 分组={gf_current}")
+                df0 = source_df.copy()
                 df0[field] = pd.to_numeric(df0[field], errors="coerce")
+                if need_area and ratio in df0.columns:
+                    df0[ratio] = convert_area_series(df0[ratio], self.area_source_unit, self.area_target_unit)
                 valid_count = int(df0[field].count())
                 if valid_count == 0:
                     skipped.append((field, gf_current))
                     continue
 
-                # 仅在需要面积占比时才处理 ratio 列
-                if need_area:
-                    area_total = df0[ratio].sum()
-                else:
-                    area_total = None
-
-                res = build_grouped_stats_frame(df0, field, gf_current)
-
-                if need_area:
+                res = build_grouped_stats_frame(df0, field, gf_current, self.plugin_stats)
+                if need_area and ratio in df0.columns:
                     if gf_current:
                         area_df = df0.groupby(gf_current, dropna=False)[ratio].sum().reset_index(name=area_col)
                         res = res.merge(area_df, on=gf_current, how="left")
-                        total_area = res[area_col].sum()
+                        total_area = pd.to_numeric(res[area_col], errors="coerce").sum()
                     else:
-                        total_area = float(area_total) if area_total is not None else 0.0
+                        total_area = float(pd.to_numeric(df0[ratio], errors="coerce").sum())
                         res[area_col] = total_area
-                    res["面积占比"] = (res[area_col] / total_area * 100) if total_area else np.nan
+                    res["面积占比"] = (pd.to_numeric(res[area_col], errors="coerce") / total_area * 100) if total_area else np.nan
 
-                res = self._round_result_frame(res, gf_current, need_area)
+                res = self._round_result_frame(res, gf_current, need_area, area_col)
                 filtered = apply_count_masks(res)
-
-                # 列切片
-                display_cols = gf_current + self.last_stats.copy()
-                if need_area:
+                display_cols = gf_current + [s for s in self.last_stats if s in filtered.columns]
+                if need_area and ratio in df0.columns:
                     display_cols += [area_col, "面积占比"]
                 tmp = filtered[display_cols].copy()
 
-                # —— 多级稳定排序 ——
                 if gf_current:
                     for col in reversed(gf_current):
                         if col in self.custom_orders:
-                            # 只保留本轮实际出现的顺序 —— 先转成 Python list 再判断
                             present_vals = tmp[col].dropna().unique().tolist()
-                            uniq = [v for v in self.custom_orders[col]
-                                    if v in present_vals]
-                            tmp[col] = pd.Categorical(
-                                tmp[col],
-                                categories=uniq,
-                                ordered=True
-                            )
-                            tmp = tmp.sort_values(by=col, kind="stable")
+                            uniq = [v for v in self.custom_orders[col] if v in present_vals]
+                            if uniq:
+                                tmp[col] = pd.Categorical(tmp[col], categories=uniq, ordered=True)
+                                tmp = tmp.sort_values(by=col, kind="stable")
+                            else:
+                                tmp = tmp.sort_values(by=col, key=lambda s: s.map(sort_key), kind="stable")
                         else:
-                            tmp = tmp.sort_values(
-                                by=col,
-                                key=lambda s: s.map(sort_key),
-                                kind="stable"
-                            )
+                            tmp = tmp.sort_values(by=col, key=lambda s: s.map(sort_key), kind="stable")
 
-                # 小计逻辑：仅当 need_sub 且有分组时，并且该组行数 >1 才输出小计
                 if need_sub and gf_current:
                     def _group_key(value):
                         return "__NA__" if pd.isna(value) else value
-
                     grp_counts = {_group_key(key): count for key, count in tmp[gf_current[0]].value_counts(dropna=False).items()}
-
                     out_rows = []
                     prev = None
                     prev_key = None
                     for _, r in tmp.iterrows():
                         cur = r[gf_current[0]]
                         cur_key = _group_key(cur)
-                        # 切组边界时，只有上一个组大小>1，才插小计
                         if prev is not None and cur_key != prev_key and grp_counts.get(prev_key, 0) > 1:
-                            out_rows.append(
-                                self._subtotal(
-                                    prev, df0, gf_current, field, ratio, need_area
-                                )
-                            )
+                            out_rows.append(self._subtotal(prev, df0, gf_current, field, ratio, need_area, area_col))
                         out_rows.append(r.to_dict())
                         prev = cur
                         prev_key = cur_key
-                    # 最后一组结束后，若该组大小>1，则插小计
                     if prev is not None and grp_counts.get(prev_key, 0) > 1:
-                        out_rows.append(
-                            self._subtotal(
-                                prev, df0, gf_current, field, ratio, need_area
-                            )
-                        )
+                        out_rows.append(self._subtotal(prev, df0, gf_current, field, ratio, need_area, area_col))
                     final_df = pd.DataFrame(out_rows, columns=tmp.columns)
                 else:
                     final_df = tmp.copy()
 
-                # 整表总计行
-                final_df = self._append_overall_total(
-                    final_df, df0, gf_current, field,
-                    ratio, need_area
-                )
-
-                # 写入 Sheet
+                final_df = self._append_overall_total(final_df, df0, gf_current, field, ratio, need_area and ratio in df0.columns, area_col)
                 name_parts = [field] + gf_current
-                sheet_name = "_".join(name_parts)[:31]
+                sheet_name = "_".join([str(p) for p in name_parts if p])[:31] or "结果"
                 final_df.to_excel(writer, index=False, sheet_name=sheet_name)
                 ws = writer.sheets[sheet_name]
                 overview_rows.append({
                     "工作表": sheet_name,
-                    "值字段": display_field,
+                    "值字段": field,
                     "分组字段": " / ".join(gf_current) if gf_current else "无分组",
                     "导出行数": len(final_df),
                     "有效数量": valid_count,
@@ -1708,93 +1616,12 @@ class HorizontalApp:
 
                 thin = Side(border_style='thin', color='000000')
                 bd = Border(thin, thin, thin, thin)
-
-                if gf_current:
-                    start_row = 2
-                    row_count = len(final_df)
-
-                    # 1) 垂直合并：每一级分类列不跨“小计” nor “总计”
-                    for ci in range(len(gf_current)):
-                        merge_start = start_row
-                        prev = ws.cell(merge_start, ci + 1).value
-
-                        for r in range(start_row + 1, start_row + row_count):
-                            curr = ws.cell(r, ci + 1).value
-
-                            # 标记：如果 prev 是小计或总计，就一定切断
-                            is_sub = isinstance(prev, str) and prev.endswith(" 合计")
-                            is_total = (prev == "总计")
-
-                            # 值变了 或者 刚好是小计/总计，都要切断上一段
-                            if curr != prev or is_sub or is_total:
-                                # 如果上一段有多行，并且上一段不是合计，就合并
-                                if r - merge_start > 1 and not (is_sub or is_total):
-                                    ws.merge_cells(
-                                        start_row=merge_start,
-                                        start_column=ci + 1,
-                                        end_row=r - 1,
-                                        end_column=ci + 1
-                                    )
-                                merge_start = r
-                                prev = curr
-
-                        # 合并最后一段，排除合计
-                        last_span = (start_row + row_count - 1) - merge_start + 1
-                        if last_span > 1:
-                            if not (isinstance(prev, str) and prev.endswith(" 合计")) \
-                                    and prev != "总计":
-                                ws.merge_cells(
-                                    start_row=merge_start,
-                                    start_column=ci + 1,
-                                    end_row=start_row + row_count - 1,
-                                    end_column=ci + 1
-                                )
-
-                    # 2) 横向合并：所有“XXX 合计” 和 最后的“总计”
-                    for r in range(start_row, start_row + row_count):
-                        v = ws.cell(r, 1).value
-                        if (isinstance(v, str) and v.endswith(" 合计")) or v == "总计":
-                            ws.merge_cells(
-                                start_row=r,
-                                start_column=1,
-                                end_row=r,
-                                end_column=len(gf_current)
-                            )
-
-                # 3) 整表样式 & 数字格式
-                # 3) 整表样式 & 数字格式 —— 按列名动态应用格式
-                dec = self.area_decimals_var.get()
-                area_fmt = "0" if dec == 0 else "0." + "0" * dec
-                percent_fmt = "0.00"
-
-                # 把 final_df.columns 映射到 Excel 列号
-                col_idx_to_name = {i + 1: name for i, name in enumerate(final_df.columns)}
-
-                for row in ws.iter_rows(
-                        min_row=1, max_row=ws.max_row,
-                        min_col=1, max_col=ws.max_column
-                ):
-                    for col_idx, cell in enumerate(row, start=1):
+                for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+                    for cell in row:
                         cell.alignment = Alignment(horizontal="center", vertical="center")
-                        cell.border = bd if "bd" in locals() else Border()
-
-                        # 跳过第一行表头
-                        if cell.row == 1:
-                            continue
-
-                        col_name = col_idx_to_name.get(col_idx, "")
-                        if col_name == area_col and isinstance(cell.value, (int, float)):
-                            # 面积列按用户设置小数位
-                            cell.number_format = area_fmt
-                        elif col_name == "面积占比" and isinstance(cell.value, (int, float)):
-                            # 面积占比固定两位
-                            cell.number_format = percent_fmt
-                        else:
-                            # 其它列：整数 0，小数两位
-                            if isinstance(cell.value, int):
-                                cell.number_format = "0"
-                            elif isinstance(cell.value, float):
-                                cell.number_format = "0.00"
+                        cell.border = bd
+                if getattr(self, 'export_charts', True):
+                    add_chart_sheet_from_frame(writer.book, sheet_name, filtered, gf_current, self.last_stats + ([area_col] if need_area else []))
 
             self._write_export_overview(writer, out, overview_rows)
 
@@ -1816,26 +1643,25 @@ class HorizontalApp:
         self.show_result_dialog(out, elapsed)
 
 
-    def _subtotal(self, fl, df_source, gf, val, ratio, need_area):
+    def _subtotal(self, fl, df_source, gf, val, ratio, need_area, area_col=None):
         row = {gf[0]: f"{fl} 合计"} if gf else {}
         for lvl in (gf[1:] if len(gf)>1 else []):
             row[lvl] = ""
         df0 = df_source[df_source[gf[0]] == fl] if gf else df_source
-        vals = calculate_series_stats(df0[val], int(df_source[val].count()))
+        vals = build_grouped_stats_frame(df0, val, [], self.plugin_stats).iloc[0].to_dict()
         vals = apply_count_masks(pd.DataFrame([vals])).iloc[0].to_dict()
         for stat in self.last_stats:
             row[stat] = vals.get(stat, "")
         if need_area:
-            a0 = df0[ratio].sum()
-            total_area = df_source[ratio].sum()
+            a0 = convert_area_series(df0[ratio], self.area_source_unit, self.area_target_unit).sum()
+            total_area = convert_area_series(df_source[ratio], self.area_source_unit, self.area_target_unit).sum()
             ap = (a0 / total_area * 100) if total_area else np.nan
 
             # 面积用用户小数位
             dec = self.area_decimals_var.get()
             fmt = "0" if dec == 0 else "0." + "0" * dec
-            row[self._get_area_column_name()] = float(Decimal(str(a0))
+            row[area_col or area_column_name(self.area_target_unit)] = float(Decimal(str(a0))
                                     .quantize(Decimal(fmt), ROUND_HALF_UP))
-            # 面积占比仍两位
             row["面积占比"] = round2(ap)
 
         return row
@@ -1863,7 +1689,6 @@ class HorizontalApp:
         self.status_var.set("彩蛋完成")
     def show_result_dialog(self, filepath, elapsed):
         mark_output(self, filepath)
-        self.save_config(show_msg=False)
         dlg = tk.Toplevel(self.root)
         dlg.title("完成")
         dlg.geometry("620x190")
@@ -1886,9 +1711,12 @@ class HorizontalApp:
         ttk.Button(frm, text="复制路径",
                    command=lambda: copy_text(self, filepath, "导出路径已复制"))\
             .grid(row=0, column=3, padx=6)
+        ttk.Button(frm, text="发布包",
+                   command=lambda: publish_output_bundle(self, filepath))\
+            .grid(row=0, column=4, padx=6)
         ttk.Button(frm, text="关闭",
                    command=dlg.destroy)\
-            .grid(row=0, column=4, padx=6)
+            .grid(row=0, column=5, padx=6)
 
         dlg.grab_set()
 
@@ -1899,4 +1727,50 @@ class HorizontalApp:
             messagebox.showerror("打开失败", str(e))
 
     def open_preview(self, filepath):
-        show_workbook_preview(self.root, filepath, title="预览结果", default_limit=300)
+        try:
+            xls = pd.read_excel(filepath, sheet_name=None)
+        except Exception as e:
+            return messagebox.showerror("预览失败", str(e))
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("预览结果")
+        dlg.geometry("800x500")
+
+        # 选择子表
+        sheets = list(xls.keys())
+        var = tk.StringVar(value=sheets[0])
+        cmb = ttk.Combobox(dlg, values=sheets, textvariable=var, state="readonly")
+        cmb.pack(fill='x', padx=12, pady=(12,6))
+
+        # Treeview 显示区域
+        container = ttk.Frame(dlg)
+        container.pack(fill='both', expand=True, padx=12, pady=(0,12))
+        tv = ttk.Treeview(container, show="headings")
+
+
+
+        vsb = ttk.Scrollbar(container, orient="vertical", command=tv.yview)
+        hsb = ttk.Scrollbar(container, orient="horizontal", command=tv.xview)
+        tv.configure(yscroll=vsb.set, xscroll=hsb.set)
+        tv.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
+
+        def load_sheet(e=None):
+            df = xls[var.get()]
+            tv.delete(*tv.get_children())
+            tv["columns"] = list(df.columns)
+            for col in df.columns:
+                tv.heading(col, text=col)
+                tv.column(col, width=100, anchor="center")
+
+            preview_df = df.head(300)
+            for row in preview_df.itertuples(index=False):
+                tv.insert("", "end", values=row)
+
+        cmb.bind("<<ComboboxSelected>>", load_sheet)
+        load_sheet()
+
+        dlg.grab_set()

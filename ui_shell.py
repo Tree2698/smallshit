@@ -13,6 +13,21 @@ import pandas as pd
 import sv_ttk
 
 from common_utils import describe_filter_conditions, open_with_default_app
+from feature_support import (
+    ensure_advanced_state,
+    merge_multiple_files_into_app,
+    open_area_conversion_dialog,
+    open_date_grouping_dialog,
+    open_field_recommendations,
+    open_filter_preset_manager,
+    open_group_mapping_manager,
+    open_operation_history,
+    open_task_center,
+    publish_output_bundle,
+    save_workspace_as,
+    load_workspace_from_file,
+    undo_last_action,
+)
 
 
 PREFERENCES_FILE = "app_preferences.json"
@@ -40,20 +55,8 @@ OUTPUT_LOCATION_LABELS = {
 OUTPUT_LOCATION_NAMES = {label: value for value, label in OUTPUT_LOCATION_LABELS.items()}
 
 
-def runtime_root() -> Path:
-    """返回运行时根目录。源码运行时为项目目录，打包后为 exe 所在目录。"""
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return runtime_root()
-
-
-def main_entry_path() -> Path:
-    """返回源码入口文件路径。仅在未打包时使用。"""
-    return runtime_root() / "main.py"
-
-
 def _preferences_path() -> Path:
-    return runtime_root() / PREFERENCES_FILE
+    return Path(__file__).resolve().with_name(PREFERENCES_FILE)
 
 
 def load_app_preferences() -> dict[str, object]:
@@ -114,6 +117,7 @@ def initialize_shell(app, *, mode_name: str, title: str) -> None:
     app.current_sheet_name = ""
     theme = str(app.app_preferences.get("theme", DEFAULT_PREFERENCES["theme"]))
     app.current_theme = apply_app_theme(theme)
+    ensure_advanced_state(app)
     app.root.title(f"{title} · {app.mode_label}")
 
 
@@ -230,79 +234,6 @@ def open_last_output(app) -> None:
         messagebox.showinfo("提示", "还没有可打开的导出结果。", parent=app.root)
         return
     app.open_file(path)
-
-
-def show_workbook_preview(root: tk.Misc, filepath: str, *, title: str = "预览结果", default_limit: int = 300) -> None:
-    """以较轻量的方式预览 Excel 文件，避免一次性加载过多行造成卡顿。"""
-    try:
-        workbook = pd.ExcelFile(filepath)
-        sheets = list(workbook.sheet_names)
-    except Exception as exc:
-        messagebox.showerror("预览失败", str(exc), parent=root)
-        return
-
-    dialog = tk.Toplevel(root)
-    dialog.title(title)
-    dialog.geometry("960x620")
-    dialog.minsize(760, 460)
-    dialog.transient(root)
-
-    container = ttk.Frame(dialog, padding=12)
-    container.pack(fill="both", expand=True)
-
-    controls = ttk.Frame(container)
-    controls.pack(fill="x", pady=(0, 8))
-
-    sheet_var = tk.StringVar(value=sheets[0] if sheets else "")
-    limit_var = tk.StringVar(value=str(default_limit))
-    info_var = tk.StringVar(value="")
-
-    ttk.Label(controls, text="工作表").pack(side="left")
-    sheet_box = ttk.Combobox(controls, values=sheets, textvariable=sheet_var, state="readonly", width=28)
-    sheet_box.pack(side="left", padx=(6, 12))
-    ttk.Label(controls, text="预览行数").pack(side="left")
-    ttk.Combobox(
-        controls,
-        values=["100", "300", "500", "1000"],
-        textvariable=limit_var,
-        state="readonly",
-        width=8,
-    ).pack(side="left", padx=(6, 12))
-    ttk.Label(controls, textvariable=info_var).pack(side="right")
-
-    tree_frame = ttk.Frame(container)
-    tree_frame.pack(fill="both", expand=True)
-    tree = ttk.Treeview(tree_frame, show="headings")
-    vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
-    hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview)
-    tree.configure(yscroll=vsb.set, xscroll=hsb.set)
-    tree.grid(row=0, column=0, sticky="nsew")
-    vsb.grid(row=0, column=1, sticky="ns")
-    hsb.grid(row=1, column=0, sticky="ew")
-    tree_frame.rowconfigure(0, weight=1)
-    tree_frame.columnconfigure(0, weight=1)
-
-    def load_sheet(_event=None) -> None:
-        try:
-            limit = int(limit_var.get())
-        except ValueError:
-            limit = default_limit
-            limit_var.set(str(default_limit))
-
-        frame = pd.read_excel(workbook, sheet_name=sheet_var.get())
-        preview_df = frame.head(limit)
-        tree.delete(*tree.get_children())
-        tree["columns"] = list(preview_df.columns)
-        for column in preview_df.columns:
-            tree.heading(column, text=column)
-            tree.column(column, width=120, anchor="center")
-        for row in preview_df.itertuples(index=False):
-            tree.insert("", "end", values=row)
-        info_var.set(f"已显示 {len(preview_df)} / {len(frame)} 行")
-
-    sheet_box.bind("<<ComboboxSelected>>", load_sheet)
-    load_sheet()
-    dialog.grab_set()
 
 
 def mark_output(app, filepath: str) -> None:
@@ -460,10 +391,16 @@ def open_data_inspector(app, initial_tab: str = "preview") -> None:
     preview_controls = ttk.Frame(preview_tab)
     preview_controls.pack(fill="x", padx=8, pady=(8, 4))
     limit_var = tk.StringVar(value="300")
+    mode_var = tk.StringVar(value="前N行")
+    search_var = tk.StringVar()
     info_var = tk.StringVar(value="")
 
+    ttk.Label(preview_controls, text="预览方式").pack(side="left")
+    ttk.Combobox(preview_controls, textvariable=mode_var, values=["前N行", "随机抽样", "筛选命中"], state="readonly", width=10).pack(side="left", padx=(6, 10))
     ttk.Label(preview_controls, text="预览行数").pack(side="left")
     ttk.Combobox(preview_controls, textvariable=limit_var, values=["100", "300", "1000", "3000"], state="readonly", width=8).pack(side="left", padx=(6, 10))
+    ttk.Label(preview_controls, text="关键词").pack(side="left")
+    ttk.Entry(preview_controls, textvariable=search_var, width=18).pack(side="left", padx=(6, 10))
 
     preview_container = ttk.Frame(preview_tab)
     preview_container.pack(fill="both", expand=True, padx=8, pady=(0, 8))
@@ -485,7 +422,16 @@ def open_data_inspector(app, initial_tab: str = "preview") -> None:
             limit = 300
             limit_var.set("300")
 
-        preview_df = df.head(limit).copy()
+        keyword = search_var.get().strip().lower()
+        mode = mode_var.get().strip()
+        preview_df = df.copy()
+        if keyword:
+            mask = preview_df.astype(str).apply(lambda col: col.str.lower().str.contains(keyword, na=False))
+            preview_df = preview_df[mask.any(axis=1)]
+        if mode == "随机抽样":
+            preview_df = preview_df.sample(min(limit, len(preview_df)), random_state=42) if len(preview_df) > 0 else preview_df
+        else:
+            preview_df = preview_df.head(limit).copy()
         columns = ["#"] + [str(column) for column in preview_df.columns]
         preview_tree["columns"] = columns
         for column in columns:
@@ -496,6 +442,7 @@ def open_data_inspector(app, initial_tab: str = "preview") -> None:
         info_var.set(f"已显示 {len(preview_df)} / {len(df)} 行")
 
     ttk.Button(preview_controls, text="刷新", command=load_preview).pack(side="left")
+    search_var.trace_add("write", lambda *_: load_preview())
     ttk.Button(preview_controls, text="复制字段名", command=lambda: copy_text(app, "\n".join(map(str, df.columns)), "字段名已复制")).pack(side="left", padx=(8, 0))
     ttk.Label(preview_controls, textvariable=info_var).pack(side="right")
 
@@ -616,6 +563,14 @@ def build_app_menu(app) -> None:
     edit_menu.add_command(label="命令面板...\tCtrl+Shift+P", command=lambda: open_command_palette(app))
     menubar.add_cascade(label="编辑", menu=edit_menu)
 
+    data_menu = tk.Menu(menubar, tearoff=0)
+    data_menu.add_command(label="字段智能推荐", command=lambda: open_field_recommendations(app))
+    data_menu.add_command(label="日期类统计...", command=lambda: open_date_grouping_dialog(app))
+    data_menu.add_command(label="分组映射 / 区间分组...", command=lambda: open_group_mapping_manager(app))
+    data_menu.add_command(label="面积单位换算...", command=lambda: open_area_conversion_dialog(app))
+    data_menu.add_command(label="多文件合并统计...", command=lambda: merge_multiple_files_into_app(app))
+    menubar.add_cascade(label="数据增强", menu=data_menu)
+
     selection_menu = tk.Menu(menubar, tearoff=0)
     selection_menu.add_command(label="选择统计量", command=app.choose_stats)
     if hasattr(app, "choose_batch_fields"):
@@ -651,6 +606,20 @@ def build_app_menu(app) -> None:
         run_menu.add_separator()
         run_menu.add_command(label="彩蛋", command=app.easter_egg)
     menubar.add_cascade(label="运行", menu=run_menu)
+
+    batch_menu = tk.Menu(menubar, tearoff=0)
+    batch_menu.add_command(label="筛选方案", command=lambda: open_filter_preset_manager(app))
+    batch_menu.add_command(label="批量任务中心", command=lambda: open_task_center(app))
+    batch_menu.add_command(label="保存工作区", command=lambda: save_workspace_as(app))
+    batch_menu.add_command(label="加载工作区", command=lambda: load_workspace_from_file(app))
+    batch_menu.add_separator()
+    batch_menu.add_command(label="撤销最近一步", command=lambda: undo_last_action(app))
+    batch_menu.add_command(label="操作历史", command=lambda: open_operation_history(app))
+    menubar.add_cascade(label="流程", menu=batch_menu)
+
+    publish_menu = tk.Menu(menubar, tearoff=0)
+    publish_menu.add_command(label="生成发布包", command=lambda: publish_output_bundle(app))
+    menubar.add_cascade(label="发布", menu=publish_menu)
 
     help_menu = tk.Menu(menubar, tearoff=0)
     help_menu.add_command(label="更新历史", command=app.show_update_history)
@@ -759,7 +728,8 @@ def restart_in_mode(app, mode: str) -> None:
     if getattr(sys, "frozen", False):
         os.execl(sys.executable, sys.executable, "--mode", mode)
     else:
-        os.execl(sys.executable, sys.executable, str(main_entry_path()), "--mode", mode)
+        main_path = Path(__file__).resolve().with_name("main.py")
+        os.execl(sys.executable, sys.executable, str(main_path), "--mode", mode)
 
 
 def build_command_actions(app) -> list[tuple[str, Callable[[], None]]]:
@@ -787,6 +757,20 @@ def build_command_actions(app) -> list[tuple[str, Callable[[], None]]]:
         actions.append(("编辑: 条件筛选", app.open_filter_builder))
     if hasattr(app, "open_group_template_manager"):
         actions.append(("编辑: 分组模板", app.open_group_template_manager))
+    actions.extend([
+        ("数据增强: 字段智能推荐", lambda: open_field_recommendations(app)),
+        ("数据增强: 日期类统计", lambda: open_date_grouping_dialog(app)),
+        ("数据增强: 分组映射/区间分组", lambda: open_group_mapping_manager(app)),
+        ("数据增强: 面积单位换算", lambda: open_area_conversion_dialog(app)),
+        ("数据增强: 多文件合并统计", lambda: merge_multiple_files_into_app(app)),
+        ("流程: 筛选方案", lambda: open_filter_preset_manager(app)),
+        ("流程: 批量任务中心", lambda: open_task_center(app)),
+        ("流程: 保存工作区", lambda: save_workspace_as(app)),
+        ("流程: 加载工作区", lambda: load_workspace_from_file(app)),
+        ("流程: 撤销最近一步", lambda: undo_last_action(app)),
+        ("流程: 操作历史", lambda: open_operation_history(app)),
+        ("发布: 生成发布包", lambda: publish_output_bundle(app)),
+    ])
 
     for index, path in enumerate(getattr(app, "recent_files", [])[:8], start=1):
         actions.append((f"文件: 最近打开 {index}. {os.path.basename(path)}", lambda p=path: app.open_recent(p)))

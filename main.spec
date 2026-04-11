@@ -1,17 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 
-from pathlib import Path
-
-project_dir = Path.cwd()
-icon_path = project_dir / "x.ico"
-icon_value = str(icon_path) if icon_path.exists() else None
+hiddenimports = [
+    "app_horizontal",
+    "app_vertical",
+    "common_utils",
+    "feature_support",
+    "ui_shell",
+    "plugins.example_plugin",
+]
 
 a = Analysis(
-    ['main.py'],
-    pathex=[str(project_dir)],
+    ["main.py"],
+    pathex=[],
     binaries=[],
-    datas=[],
-    hiddenimports=['app_horizontal', 'app_vertical'],
+    datas=[("plugins", "plugins")],
+    hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -19,7 +22,6 @@ a = Analysis(
     noarchive=False,
     optimize=0,
 )
-
 pyz = PYZ(a.pure)
 
 exe = EXE(
@@ -27,7 +29,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='xiaolaoxiang',
+    name="小捞翔",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -38,9 +40,8 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=icon_value,
+    icon=["x.ico"],
 )
-
 coll = COLLECT(
     exe,
     a.binaries,
@@ -48,5 +49,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='xiaolaoxiang',
+    name="小捞翔",
 )

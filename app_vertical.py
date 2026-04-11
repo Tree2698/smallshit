@@ -15,20 +15,33 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinterdnd2 import DND_FILES
 
 from common_utils import (
-    EXTENDED_STATS,
     FILTER_OPERATORS,
-    apply_filter_conditions,
     apply_count_masks,
+    area_column_name,
     build_grouped_stats_frame,
-    AREA_UNITS,
-    calculate_series_stats,
+    add_chart_sheet_from_frame,
     convert_area_series,
     describe_filter_conditions,
-    get_area_column_name,
+    friendly_error_message,
+    get_extended_stats_with_plugins,
+    load_stat_plugins,
     open_with_default_app,
     read_csv_safely,
     round2,
     sort_key,
+)
+from feature_support import (
+    apply_advanced_state,
+    collect_advanced_state,
+    ensure_advanced_state,
+    get_active_data_generic,
+    get_filtered_data_generic,
+    open_filter_builder_generic,
+    open_group_template_manager_generic,
+    prepare_loaded_dataframe,
+    publish_output_bundle,
+    show_exception_dialog,
+    update_loaded_status_generic,
 )
 from ui_shell import (
     begin_busy,
@@ -43,20 +56,35 @@ from ui_shell import (
     open_output_folder,
     populate_recent_menus,
     set_status,
-    show_workbook_preview,
 )
 
 # 当前程序版本号——每次发布时请手动更新
-APP_VERSION = "1.2.0"
+APP_VERSION = "2.0.3"
 
 UPDATE_CONTENT = """
-小捞翔·至尊版 v1.2.0 更新日志：
-- 新增：扩展统计指标，支持缺失数、缺失率、四分位数、极差、方差、偏度、峰度等
-- 新增：自动生成“统计说明”和“导出清单”工作表，方便回看参数和输出内容
-- 新增：值字段会自动尝试转为数值，无法计算的组合会提示并自动跳过
-- 优化：横版和竖版统计口径统一，更多统计方法在两个界面保持一致
-- 优化：统计量选择面板扩大，容纳更多指标
-- 优化：取消批量选项后会自动清空对应字段，减少误操作
+小捞翔·至尊版 v2.0.3 更新日志：
+- 修复：源码运行与打包后切换到竖版时可能找不到模块的问题
+- 修复：竖版统计说明页里的面积换算 f-string 语法错误
+- 修复：横版条件筛选缺少导入导致 apply_filter_conditions / describe_filter_conditions 未定义
+- 修复：导出格式与小计展示的若干兼容问题
+- 修复：未启用值字段、仅启用面积字段时会报错的问题
+- 新增：面积单位换算，支持平方米、亩、公顷、平方千米之间自动换算
+- 新增：导出面积列名会根据目标单位自动显示为“面积（单位）”
+- 新增：面积单位设置会保存到本地配置
+- 新增：统计图表导出
+- 新增：筛选方案保存与加载
+- 新增：批量任务中心
+- 新增：多文件合并统计
+- 新增：字段智能推荐
+- 新增：日期类统计
+- 新增：分组映射与区间分组
+- 新增：增强预览模式
+- 优化：错误提示更加友好，减少直接抛出技术性报错
+- 新增：工作区管理
+- 新增：导出发布链路
+- 新增：插件化统计指标能力
+- 新增：操作历史与撤销功能
+- 优化：README 与程序功能说明同步更新
 """
 
 # 默认配置文件名（可自定义目录）
@@ -91,6 +119,7 @@ class VerticalApp:
         # 初始化属性
         self.excel_path = ""
         self.data = pd.DataFrame()
+        self.plugin_stats = load_stat_plugins()
         self.batch_fields = []
         self.group_batch_fields = []
         self.filter_conditions = []
@@ -98,9 +127,10 @@ class VerticalApp:
         self.active_group_template_name = ""
         self.update_history = []  # 更新历史记录
         self.shown_version = ""  # 已显示的版本
+        ensure_advanced_state(self)
 
         # 保存上次选择的统计量，初始全选
-        self.all_stats = EXTENDED_STATS.copy()
+        self.all_stats = get_extended_stats_with_plugins(self.plugin_stats)
         self.last_stats = self.all_stats.copy()
 
         # 构建菜单栏
@@ -115,7 +145,6 @@ class VerticalApp:
         # 载入上次保存的配置
         self.load_config()
         self.create_recent_menu()
-        self.toggle_area_fields()
         bind_shortcuts(self)
         # 检查更新
         self.check_for_update()
@@ -126,447 +155,19 @@ class VerticalApp:
         self.save_config(show_msg=False)
         self.root.destroy()
 
-    def _normalize_filter_conditions(self, cols):
-        normalized = []
-        for condition in getattr(self, "filter_conditions", []):
-            if not isinstance(condition, dict):
-                continue
-            field = str(condition.get("field", "")).strip()
-            op = str(condition.get("op", "")).strip()
-            if field and op and field in cols:
-                normalized.append(
-                    {
-                        "field": field,
-                        "op": op,
-                        "value": str(condition.get("value", "")),
-                        "enabled": bool(condition.get("enabled", True)),
-                    }
-                )
-        self.filter_conditions = normalized
-
-    def _filter_summary(self):
-        active_conditions = [c for c in self.filter_conditions if c.get("enabled", True)]
-        return describe_filter_conditions(active_conditions)
-
-    def _get_filtered_data(self, show_error=True):
-        if self.data.empty:
-            return self.data.copy()
-
-        try:
-            return apply_filter_conditions(self.data, self.filter_conditions)
-        except Exception as exc:
-            if show_error:
-                messagebox.showerror("筛选条件有误", str(exc))
-                set_status(self, "筛选条件有误，请检查后再试")
-            return None
-
-    def get_active_data(self):
-        filtered = self._get_filtered_data(show_error=False)
-        if isinstance(filtered, pd.DataFrame):
-            return filtered
-        return self.data
-
-    def _update_loaded_status(self):
-        if self.data.empty:
-            set_status(self, f"{self.mode_label} 就绪")
-            return
-
-        total_rows = len(self.data)
-        total_cols = len(self.data.columns)
-        if not self.filter_conditions:
-            set_status(self, f"已加载 {total_rows} 行 / {total_cols} 列")
-            return
-
-        filtered = self._get_filtered_data(show_error=False)
-        if filtered is None:
-            set_status(self, f"已加载 {total_rows} 行 / {total_cols} 列，筛选条件待修正")
-            return
-
-        set_status(self, f"已加载 {total_rows} 行 / {total_cols} 列，筛选后 {len(filtered)} 行")
-
-    def _collect_group_template(self):
-        return {
-            "ui_state": self._collect_ui_state(),
-            "stats": list(self.last_stats),
-        }
-
-    def _describe_group_template(self, name, payload):
-        state = payload.get("ui_state", {}) if isinstance(payload, dict) else {}
-        stats = payload.get("stats", []) if isinstance(payload, dict) else []
-        lines = [
-            f"模板名称：{name}",
-            f"分类级别：{' / '.join(state.get('levels', [])) or '未设置'}",
-            f"值字段：{state.get('value_field') or '未设置'}",
-            f"面积字段：{state.get('ratio_field') or '未设置'}",
-            f"面积单位：{state.get('area_source_unit', '亩')} → {state.get('area_target_unit', '亩')}",
-            f"面积统计：{'是' if state.get('area_enabled', False) else '否'}",
-            f"批量值字段：{' / '.join(state.get('batch_fields', [])) or '未启用'}",
-            f"批量分组字段：{' / '.join(state.get('group_batch_fields', [])) or '未启用'}",
-            f"统计量：{' / '.join(stats) if stats else '未设置'}",
-        ]
-        return "\n".join(lines)
-
-    def _apply_group_template(self, payload, template_name=""):
-        if self.data.empty:
-            messagebox.showwarning("提示", "请先加载数据后再应用模板")
-            return False
-
-        if not isinstance(payload, dict):
-            messagebox.showerror("错误", "模板内容无效")
-            return False
-
-        state = payload.get("ui_state", {})
-        if not isinstance(state, dict):
-            messagebox.showerror("错误", "模板缺少界面配置")
-            return False
-
-        cols = list(self.data.columns)
-        enabled_fields = list(state.get("levels", []))
-        if state.get("value_field"):
-            enabled_fields.append(state.get("value_field"))
-        if state.get("area_enabled", False) and state.get("ratio_field"):
-            enabled_fields.append(state.get("ratio_field"))
-        if state.get("batch_enabled", False):
-            enabled_fields.extend(state.get("batch_fields", []))
-        if state.get("group_batch_enabled", False):
-            enabled_fields.extend(state.get("group_batch_fields", []))
-
-        missing_fields = sorted({field for field in enabled_fields if field and field not in cols})
-        if missing_fields:
-            messagebox.showwarning("模板无法应用", "当前数据缺少以下字段：\n" + "\n".join(missing_fields))
-            return False
-
-        self.saved_ui_state = state
-        self._restore_ui_state(cols)
-        stats = [stat for stat in payload.get("stats", []) if stat in self.all_stats]
-        if stats:
-            self.last_stats = stats
-        self.active_group_template_name = template_name
-        self._update_loaded_status()
-        return True
-
-    def open_group_template_manager(self):
-        dialog = tk.Toplevel(self.root)
-        dialog.title("分组模板")
-        dialog.geometry("720x420")
-        dialog.transient(self.root)
-
-        container = ttk.Frame(dialog, padding=12)
-        container.pack(fill="both", expand=True)
-        container.columnconfigure(1, weight=1)
-        container.rowconfigure(0, weight=1)
-
-        left = ttk.Frame(container)
-        left.grid(row=0, column=0, sticky="ns", padx=(0, 12))
-        right = ttk.Frame(container)
-        right.grid(row=0, column=1, sticky="nsew")
-        right.rowconfigure(1, weight=1)
-
-        ttk.Label(left, text="已保存模板").pack(anchor="w")
-        listbox = tk.Listbox(left, width=24, height=16)
-        listbox.pack(fill="y", expand=True, pady=(6, 8))
-
-        ttk.Label(right, text="模板内容").grid(row=0, column=0, sticky="w")
-        preview = tk.Text(right, wrap="word", state="disabled", height=16)
-        preview.grid(row=1, column=0, sticky="nsew", pady=(6, 8))
-
-        buttons = ttk.Frame(right)
-        buttons.grid(row=2, column=0, sticky="e")
-
-        def selected_name():
-            selection = listbox.curselection()
-            if not selection:
-                return ""
-            return listbox.get(selection[0])
-
-        def refresh_templates(target_name=""):
-            names = sorted(self.group_templates)
-            listbox.delete(0, "end")
-            for name in names:
-                listbox.insert("end", name)
-
-            if target_name and target_name in names:
-                index = names.index(target_name)
-                listbox.selection_set(index)
-                listbox.see(index)
-            elif names:
-                listbox.selection_set(0)
-
-            update_preview()
-
-        def update_preview(_event=None):
-            name = selected_name()
-            content = "暂无模板"
-            if name:
-                content = self._describe_group_template(name, self.group_templates.get(name, {}))
-            preview.configure(state="normal")
-            preview.delete("1.0", "end")
-            preview.insert("1.0", content)
-            preview.configure(state="disabled")
-
-        def save_current_template():
-            if self.data.empty:
-                messagebox.showwarning("提示", "请先加载数据后再保存模板")
-                return
-
-            initial_name = self.active_group_template_name or selected_name() or "常用模板"
-            name = simpledialog.askstring("保存模板", "请输入模板名称：", parent=dialog, initialvalue=initial_name)
-            if not name:
-                return
-            name = name.strip()
-            if not name:
-                return
-
-            self.group_templates[name] = self._collect_group_template()
-            self.active_group_template_name = name
-            self.save_config(show_msg=False)
-            refresh_templates(name)
-            set_status(self, f"模板“{name}”已保存")
-
-        def apply_selected_template():
-            name = selected_name()
-            if not name:
-                messagebox.showinfo("提示", "请先选择一个模板")
-                return
-            if self._apply_group_template(self.group_templates.get(name, {}), name):
-                self.save_config(show_msg=False)
-                dialog.destroy()
-
-        def delete_selected_template():
-            name = selected_name()
-            if not name:
-                return
-            if not messagebox.askyesno("确认删除", f"确定要删除模板“{name}”吗？", parent=dialog):
-                return
-            self.group_templates.pop(name, None)
-            if self.active_group_template_name == name:
-                self.active_group_template_name = ""
-            self.save_config(show_msg=False)
-            refresh_templates()
-
-        def export_selected_template():
-            name = selected_name()
-            if not name:
-                messagebox.showinfo("提示", "请先选择一个模板")
-                return
-            path = filedialog.asksaveasfilename(
-                title="导出模板",
-                defaultextension=".json",
-                filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
-                initialfile=f"{name}.json",
-            )
-            if not path:
-                return
-            with open(path, "w", encoding="utf-8") as file:
-                json.dump({"name": name, "template": self.group_templates[name]}, file, ensure_ascii=False, indent=2)
-            set_status(self, f"模板已导出到 {os.path.basename(path)}")
-
-        def import_template():
-            path = filedialog.askopenfilename(
-                title="导入模板",
-                filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
-            )
-            if not path:
-                return
-
-            with open(path, "r", encoding="utf-8") as file:
-                payload = json.load(file)
-
-            if isinstance(payload, dict) and "template" in payload:
-                name = str(payload.get("name") or os.path.splitext(os.path.basename(path))[0]).strip()
-                template = payload.get("template", {})
-            else:
-                name = os.path.splitext(os.path.basename(path))[0]
-                template = payload
-
-            if not name or not isinstance(template, dict):
-                messagebox.showerror("导入失败", "模板文件格式不正确")
-                return
-
-            self.group_templates[name] = template
-            self.save_config(show_msg=False)
-            refresh_templates(name)
-            set_status(self, f"模板“{name}”已导入")
-
-        ttk.Button(buttons, text="保存当前", command=save_current_template).pack(side="left", padx=(0, 6))
-        ttk.Button(buttons, text="应用", command=apply_selected_template).pack(side="left", padx=6)
-        ttk.Button(buttons, text="删除", command=delete_selected_template).pack(side="left", padx=6)
-        ttk.Button(buttons, text="导出", command=export_selected_template).pack(side="left", padx=6)
-        ttk.Button(buttons, text="导入", command=import_template).pack(side="left", padx=6)
-        ttk.Button(buttons, text="关闭", command=dialog.destroy).pack(side="left", padx=(6, 0))
-
-        listbox.bind("<<ListboxSelect>>", update_preview)
-        refresh_templates(self.active_group_template_name)
-        dialog.grab_set()
-        self.root.wait_window(dialog)
-
-    def open_filter_builder(self):
-        if self.data.empty:
-            messagebox.showwarning("提示", "请先加载数据后再设置筛选条件")
-            return
-
-        dialog = tk.Toplevel(self.root)
-        dialog.title("条件筛选")
-        dialog.geometry("760x420")
-        dialog.transient(self.root)
-
-        container = ttk.Frame(dialog, padding=12)
-        container.pack(fill="both", expand=True)
-        container.rowconfigure(1, weight=1)
-        container.columnconfigure(0, weight=1)
-
-        ttk.Label(container, text=f"当前数据共 {len(self.data)} 行，可添加多个筛选条件。").grid(row=0, column=0, sticky="w")
-
-        rows_frame = ttk.Frame(container)
-        rows_frame.grid(row=1, column=0, sticky="nsew", pady=(10, 8))
-        rows_frame.columnconfigure(0, weight=1)
-
-        summary_var = tk.StringVar()
-        detail_var = tk.StringVar(value=self._filter_summary())
-        condition_rows = []
-        cols = list(self.data.columns)
-
-        def collect_conditions():
-            conditions = []
-            for item in condition_rows:
-                field = item["field"].get().strip()
-                op = item["op"].get().strip()
-                value = item["value"].get().strip()
-                enabled = bool(item["enabled"].get())
-                if field and op:
-                    conditions.append(
-                        {
-                            "field": field,
-                            "op": op,
-                            "value": value,
-                            "enabled": enabled,
-                        }
-                    )
-            return conditions
-
-        def refresh_summary():
-            conditions = collect_conditions()
-            active_conditions = [c for c in conditions if c.get("enabled", True)]
-            detail_var.set(describe_filter_conditions(active_conditions))
-            try:
-                filtered = apply_filter_conditions(self.data, conditions)
-            except Exception as exc:
-                summary_var.set(f"条件有误：{exc}")
-                return
-
-            if active_conditions:
-                summary_var.set(f"已启用 {len(active_conditions)} 条，筛选后 {len(filtered)} / {len(self.data)} 行")
-            else:
-                summary_var.set(f"当前未启用筛选，将使用全部 {len(self.data)} 行数据")
-
-        def remove_condition(item):
-            item["frame"].destroy()
-            if item in condition_rows:
-                condition_rows.remove(item)
-            if not condition_rows:
-                add_condition_row()
-            refresh_summary()
-
-        def add_condition_row(condition=None):
-            condition = condition or {}
-            frame = ttk.Frame(rows_frame)
-            frame.pack(fill="x", pady=4)
-
-            enabled_var = tk.BooleanVar(value=bool(condition.get("enabled", True)))
-            field_var = tk.StringVar(value=str(condition.get("field", cols[0] if cols else "")))
-            op_var = tk.StringVar(value=str(condition.get("op", FILTER_OPERATORS[0])))
-            value_var = tk.StringVar(value=str(condition.get("value", "")))
-
-            ttk.Checkbutton(frame, text="启用", variable=enabled_var, command=refresh_summary).pack(side="left")
-            field_box = ttk.Combobox(frame, values=cols, textvariable=field_var, state="readonly", width=20)
-            field_box.pack(side="left", padx=(8, 6))
-            op_box = ttk.Combobox(frame, values=FILTER_OPERATORS, textvariable=op_var, state="readonly", width=12)
-            op_box.pack(side="left", padx=6)
-            value_entry = ttk.Entry(frame, textvariable=value_var, width=22)
-            value_entry.pack(side="left", padx=6)
-
-            item = {
-                "frame": frame,
-                "enabled": enabled_var,
-                "field": field_var,
-                "op": op_var,
-                "value": value_var,
-            }
-
-            def sync_value_state(*_args):
-                disabled = op_var.get() in {"为空", "不为空"}
-                value_entry.configure(state="disabled" if disabled else "normal")
-                if disabled:
-                    value_var.set("")
-                refresh_summary()
-
-            op_var.trace_add("write", sync_value_state)
-            field_box.bind("<<ComboboxSelected>>", lambda _event: refresh_summary())
-            value_entry.bind("<KeyRelease>", lambda _event: refresh_summary())
-            ttk.Button(frame, text="删除", command=lambda: remove_condition(item)).pack(side="left", padx=(6, 0))
-            condition_rows.append(item)
-            sync_value_state()
-
-        controls = ttk.Frame(container)
-        controls.grid(row=2, column=0, sticky="ew")
-        ttk.Button(controls, text="新增条件", command=add_condition_row).pack(side="left")
-        ttk.Button(
-            controls,
-            text="清空筛选",
-            command=lambda: (
-                [row["frame"].destroy() for row in condition_rows],
-                condition_rows.clear(),
-                self.filter_conditions.clear(),
-                add_condition_row(),
-                refresh_summary(),
-            ),
-        ).pack(side="left", padx=6)
-
-        ttk.Label(container, textvariable=summary_var).grid(row=3, column=0, sticky="w", pady=(10, 2))
-        ttk.Label(container, textvariable=detail_var, wraplength=700).grid(row=4, column=0, sticky="w")
-
-        buttons = ttk.Frame(container)
-        buttons.grid(row=5, column=0, sticky="e", pady=(12, 0))
-
-        def apply_conditions():
-            conditions = collect_conditions()
-            try:
-                filtered = apply_filter_conditions(self.data, conditions)
-            except Exception as exc:
-                messagebox.showerror("筛选条件有误", str(exc), parent=dialog)
-                return
-
-            self.filter_conditions = [c for c in conditions if c.get("enabled", True)]
-            self._update_loaded_status()
-            self.save_config(show_msg=False)
-            if self.filter_conditions:
-                set_status(self, f"筛选已更新，当前保留 {len(filtered)} 行")
-            else:
-                set_status(self, f"已清除筛选，当前共 {len(self.data)} 行")
-            dialog.destroy()
-
-        ttk.Button(buttons, text="应用", command=apply_conditions).pack(side="left", padx=(0, 6))
-        ttk.Button(buttons, text="关闭", command=dialog.destroy).pack(side="left")
-
-        existing_conditions = self.filter_conditions or [{}]
-        for condition in existing_conditions:
-            add_condition_row(condition)
-        refresh_summary()
-        dialog.grab_set()
-        self.root.wait_window(dialog)
-
     def _collect_ui_state(self):
         return {
             "levels": [lvl["var"].get() for lvl in self.levels if lvl["var"].get()],
             "value_field": self.val_var.get(),
             "ratio_field": self.ratio_var.get(),
             "area_enabled": bool(self.area_cb.get()),
-            "area_source_unit": self.area_source_unit_var.get(),
-            "area_target_unit": self.area_target_unit_var.get(),
             "batch_enabled": bool(self.batch_var.get()),
             "batch_fields": list(self.batch_fields),
             "group_batch_enabled": bool(self.group_batch_var.get()),
             "group_batch_fields": list(self.group_batch_fields),
+            "area_source_unit": getattr(self, "area_source_unit", "平方米"),
+            "area_target_unit": getattr(self, "area_target_unit", "亩"),
+            "export_charts": bool(getattr(self, "export_charts", True)),
         }
 
     def _set_level_count(self, target_count):
@@ -598,9 +199,6 @@ class VerticalApp:
             self.ratio_var.set(saved_ratio)
 
         self.area_cb.set(bool(state.get("area_enabled", self.area_cb.get())))
-        self.area_source_unit_var.set(str(state.get("area_source_unit", self.area_source_unit_var.get()) or "亩"))
-        self.area_target_unit_var.set(str(state.get("area_target_unit", self.area_target_unit_var.get()) or "亩"))
-        self.toggle_area_fields()
         if self.area_cb.get() and saved_ratio in cols:
             self.ratio_var.set(saved_ratio)
 
@@ -611,6 +209,24 @@ class VerticalApp:
         self.group_batch_var.set(bool(state.get("group_batch_enabled", False)))
         self.toggle_group_batch()
         self.group_batch_fields = [field for field in state.get("group_batch_fields", []) if field in cols]
+        self.area_source_unit = state.get("area_source_unit", getattr(self, "area_source_unit", "平方米"))
+        self.area_target_unit = state.get("area_target_unit", getattr(self, "area_target_unit", "亩"))
+        self.export_charts = bool(state.get("export_charts", getattr(self, "export_charts", True)))
+
+    def _get_filtered_data(self, show_error=True):
+        return get_filtered_data_generic(self, show_error)
+
+    def get_active_data(self):
+        return get_active_data_generic(self)
+
+    def _update_loaded_status(self):
+        return update_loaded_status_generic(self)
+
+    def open_filter_builder(self):
+        return open_filter_builder_generic(self)
+
+    def open_group_template_manager(self):
+        return open_group_template_manager_generic(self)
 
     def save_config(self, path=None, show_msg=True):
         """保存配置到JSON文件"""
@@ -621,13 +237,11 @@ class VerticalApp:
             "recent_files": self.recent_files
             , "custom_orders": self.custom_orders,
             "area_decimals": self.area_decimals_var.get(),
-            "area_source_unit": self.area_source_unit_var.get(),
-            "area_target_unit": self.area_target_unit_var.get(),
             "ui_state": self._collect_ui_state(),
             "filter_conditions": self.filter_conditions,
             "group_templates": self.group_templates,
             "active_group_template_name": self.active_group_template_name,
-            "last_output_path": self.last_output_path,
+            "advanced_state": collect_advanced_state(self),
         }
         cfg_path = path or CONFIG_FILE
         try:
@@ -662,13 +276,11 @@ class VerticalApp:
             self.custom_orders = cfg.get("custom_orders", {})
             dec = cfg.get("area_decimals", 2)
             self.area_decimals_var.set(dec)
-            self.area_source_unit_var.set(str(cfg.get("area_source_unit", self.area_source_unit_var.get()) or "亩"))
-            self.area_target_unit_var.set(str(cfg.get("area_target_unit", self.area_target_unit_var.get()) or "亩"))
             self.saved_ui_state = cfg.get("ui_state", {})
             self.filter_conditions = cfg.get("filter_conditions", [])
             self.group_templates = cfg.get("group_templates", {})
             self.active_group_template_name = cfg.get("active_group_template_name", "")
-            self.last_output_path = cfg.get("last_output_path")
+            apply_advanced_state(self, cfg.get("advanced_state", {}))
         # 配置载入后刷新最近打开菜单（如果已经创建）
             if hasattr(self, "create_recent_menu"):
                 self.create_recent_menu()
@@ -815,7 +427,8 @@ class VerticalApp:
         frm.pack(fill="x", padx=10, pady=6)
 
         # 值字段
-        ttk.Label(frm, text="值字段:")             .grid(row=0, column=0, sticky="w")
+        ttk.Label(frm, text="值字段:") \
+            .grid(row=0, column=0, sticky="w")
         self.val_var = tk.StringVar()
         self.val_menu = ttk.Combobox(
             frm, textvariable=self.val_var,
@@ -824,42 +437,28 @@ class VerticalApp:
         self.val_menu.grid(row=0, column=1, sticky="w")
 
         # 面积占比字段
-        ttk.Label(frm, text="面积占比字段:")             .grid(row=1, column=0, sticky="w")
+        ttk.Label(frm, text="面积占比字段:") \
+            .grid(row=1, column=0, sticky="w")
         self.ratio_var = tk.StringVar()
         self.ratio_menu = ttk.Combobox(
             frm, textvariable=self.ratio_var,
             state="readonly", width=28
         )
         self.ratio_menu.grid(row=1, column=1, sticky="w")
-        self.area_cb = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            frm, text="计算面积占比", variable=self.area_cb, command=self.toggle_area_fields
-        ).grid(row=1, column=2, padx=5)
-
-        ttk.Label(frm, text="面积当前单位:")             .grid(row=2, column=0, sticky="w")
-        self.area_source_unit_var = tk.StringVar(value="亩")
-        self.area_source_unit_menu = ttk.Combobox(
-            frm, textvariable=self.area_source_unit_var,
-            state="readonly", width=12, values=AREA_UNITS
-        )
-        self.area_source_unit_menu.grid(row=2, column=1, sticky="w")
-
-        ttk.Label(frm, text="换算为:")             .grid(row=2, column=2, padx=5, sticky="w")
-        self.area_target_unit_var = tk.StringVar(value="亩")
-        self.area_target_unit_menu = ttk.Combobox(
-            frm, textvariable=self.area_target_unit_var,
-            state="readonly", width=12, values=AREA_UNITS
-        )
-        self.area_target_unit_menu.grid(row=2, column=3, sticky="w")
-
         # 面积小数位
-        ttk.Label(frm, text="面积小数位:")             .grid(row=3, column=0, sticky="w")
+        ttk.Label(frm, text="面积小数位:") \
+            .grid(row=2, column=0, sticky="w")
+
         self.area_decimals_var = tk.IntVar(value=2)
         self.area_decimals_spin = ttk.Spinbox(
             frm, from_=0, to=10, textvariable=self.area_decimals_var,
             width=5, state="readonly"
         )
-        self.area_decimals_spin.grid(row=3, column=1, sticky="w")
+        self.area_decimals_spin.grid(row=2, column=1, sticky="w")
+        self.area_cb = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            frm, text="计算面积占比", variable=self.area_cb
+        ).grid(row=1, column=2, padx=5)
 
     def _build_batch_controls(self):
         """添加批量功能控件"""
@@ -913,19 +512,6 @@ class VerticalApp:
 
 
 
-
-    def toggle_area_fields(self):
-        if self.area_cb.get():
-            self.ratio_menu.state(["!disabled"])
-            self.area_decimals_spin.state(["!disabled"])
-            self.area_source_unit_menu.state(["!disabled"])
-            self.area_target_unit_menu.state(["!disabled"])
-        else:
-            self.ratio_menu.state(["disabled"])
-            self.ratio_var.set("")
-            self.area_decimals_spin.state(["disabled"])
-            self.area_source_unit_menu.state(["disabled"])
-            self.area_target_unit_menu.state(["disabled"])
 
     def toggle_batch(self):
         """切换批量值字段按钮状态"""
@@ -1014,28 +600,7 @@ class VerticalApp:
             anchor="w",
         ).pack(side="bottom", fill="x")
 
-    def _get_area_column_name(self):
-        return get_area_column_name(self.area_target_unit_var.get())
-
-    def _get_area_units_text(self):
-        return f"{self.area_source_unit_var.get()} → {self.area_target_unit_var.get()}"
-
-    def _resolve_value_fields(self, need_area):
-        batch_fields = [field for field in getattr(self, "batch_fields", []) if field]
-        if self.batch_var.get() and batch_fields:
-            return batch_fields
-
-        value_field = self.val_var.get().strip()
-        if value_field:
-            return [value_field]
-
-        ratio_field = self.ratio_var.get().strip()
-        if need_area and ratio_field:
-            return [ratio_field]
-
-        return []
-
-    def _round_result_frame(self, df, group_fields, need_area):
+    def _round_result_frame(self, df, group_fields, need_area, area_col=None):
         dec = self.area_decimals_var.get()
 
         def round_dec(value, digits):
@@ -1048,28 +613,25 @@ class VerticalApp:
         for column in df.columns:
             if column in group_fields or column in {"数量", "缺失数"}:
                 continue
-            if column == self._get_area_column_name() and need_area:
+            if need_area and area_col and column == area_col:
                 df[column] = df[column].apply(lambda value: round_dec(value, dec))
             else:
                 df[column] = df[column].apply(round2)
         return df
 
     def _write_export_overview(self, writer, output_path, overview_rows):
-        active_filters = [c for c in self.filter_conditions if c.get("enabled", True)]
-        filtered_rows = len(self.get_active_data()) if hasattr(self, "get_active_data") else len(self.data)
         summary_rows = [
             {"项目": "导出时间", "内容": time.strftime("%Y-%m-%d %H:%M:%S")},
             {"项目": "模式", "内容": self.mode_label},
             {"项目": "源文件", "内容": self.excel_path},
             {"项目": "数据源", "内容": self.current_sheet_name or "当前数据"},
-            {"项目": "原始记录数", "内容": len(self.data)},
-            {"项目": "导出记录数", "内容": filtered_rows},
             {"项目": "导出文件", "内容": output_path},
             {"项目": "统计量", "内容": "、".join(self.last_stats)},
             {"项目": "面积统计", "内容": "是" if self.area_cb.get() else "否"},
-            {"项目": "面积换算", "内容": self._get_area_units_text() if self.area_cb.get() else "未启用"},
-            {"项目": "筛选条件", "内容": describe_filter_conditions(active_filters)},
-            {"项目": "当前模板", "内容": self.active_group_template_name or "未使用"},
+            {"项目": "面积换算", "内容": f"{getattr(self, 'area_source_unit', '平方米')} -> {getattr(self, 'area_target_unit', '亩')}"},
+            {"项目": "导出图表", "内容": "是" if getattr(self, "export_charts", True) else "否"},
+            {"项目": "筛选条件", "内容": describe_filter_conditions(getattr(self, "filter_conditions", []))},
+            {"项目": "分组模板", "内容": self.active_group_template_name or "未使用"},
             {"项目": "批量值字段", "内容": "、".join(self.batch_fields) if self.batch_fields else "未启用"},
             {"项目": "批量分组字段", "内容": "、".join(self.group_batch_fields) if self.group_batch_fields else "未启用"},
         ]
@@ -1170,11 +732,11 @@ class VerticalApp:
         self.root.after(0, lambda: self._on_sheet_loaded(df, sheet))
 
     def _on_sheet_loaded(self, df, sheet):
-        self.data = df
+        self.data = prepare_loaded_dataframe(self, df)
         self.current_sheet_name = sheet
         self.lbl_file.config(text=os.path.basename(self.excel_path))
 
-        cols = list(df.columns)
+        cols = list(self.data.columns)
         # 刷新分类级下拉
         for idx, lvl in enumerate(self.levels):
             var, combo = lvl["var"], lvl["combo"]
@@ -1193,10 +755,9 @@ class VerticalApp:
             self.val_var.set(cols[-1])
             self.ratio_var.set(cols[-1])
         self._restore_ui_state(cols)
-        self._normalize_filter_conditions(cols)
         self.calculate_btn.state(["!disabled"])
-        self._hide_progress()
-        self._update_loaded_status()
+        update_loaded_status_generic(self)
+        self._hide_progress(self.status_var.get())
 
     def add_level(self):
         if len(self.levels) >= MAX_LEVELS:
@@ -1338,157 +899,111 @@ class VerticalApp:
             messagebox.showerror("错误", "请先选择并加载数据")
             return
 
-        active_df = self._get_filtered_data(show_error=True)
-        if active_df is None:
-            return
-        if active_df.empty:
-            messagebox.showwarning("提示", "筛选后没有可用数据，请调整条件后再试。")
-            return
-
-        # 直接使用按钮预先设置好的统计量顺序
         stats = self.last_stats.copy()
         if not stats:
             messagebox.showwarning("提示", "未选择任何统计量，已取消")
             return
-        # 确定分组字段
+
+        source_df = self.get_active_data().copy()
+        if source_df.empty:
+            messagebox.showwarning("提示", "筛选后没有可用于统计的数据。")
+            return
+
         if self.group_batch_var.get() and self.group_batch_fields:
             group_fields_list = [[field] for field in self.group_batch_fields]
         else:
-            group_fields = [
-                lvl["var"].get() for lvl in self.levels
-                if lvl["var"].get()
-            ]
+            group_fields = [lvl["var"].get() for lvl in self.levels if lvl["var"].get()]
             group_fields_list = [group_fields] if group_fields else [[]]
 
-        need_area = self.area_cb.get()
+        need_area = bool(self.area_cb.get() and self.ratio_var.get())
         ratio = self.ratio_var.get().strip()
-        if need_area and not ratio:
-            messagebox.showerror("错误", "已启用面积统计，但尚未选择面积字段。")
-            return
+        if self.batch_var.get() and self.batch_fields:
+            val_fields = [field for field in self.batch_fields if field in source_df.columns]
+        elif self.val_var.get().strip():
+            val_fields = [self.val_var.get().strip()]
+        else:
+            val_fields = []
 
-        # 确定值字段
-        val_fields = self._resolve_value_fields(need_area)
+        if not val_fields and need_area:
+            val_fields = [ratio]
 
-
-        # 校验字段
         all_fields = set()
         for group_fields in group_fields_list:
             all_fields.update(group_fields)
         all_fields.update(val_fields)
         if need_area:
             all_fields.add(ratio)
-
         for f in all_fields:
-            if f and f not in active_df.columns:
+            if f and f not in source_df.columns:
                 messagebox.showerror("错误", f"列 '{f}' 不存在")
                 return
-
-        if not val_fields:
-            messagebox.showerror("错误", "没有可统计的值字段；若只做面积统计，请先选择面积字段。")
-            return
 
         self.calculate_btn.state(["disabled"])
         self._show_progress("正在计算...")
 
-        # 准备输出文件
-        base = os.path.splitext(os.path.basename(self.excel_path))[0]
+        base = os.path.splitext(os.path.basename(self.excel_path))[0] if self.excel_path else "统计结果"
         out = build_output_path(self, f"{base}_计算小捞翔后")
-
+        area_col = area_column_name(getattr(self, "area_target_unit", "亩"))
         overview_rows = []
         skipped = []
         with pd.ExcelWriter(out, engine="openpyxl") as writer:
             for val in val_fields:
                 for group_fields in group_fields_list:
-                    df0 = active_df.copy()
-                    if need_area:
-                        df0[ratio] = convert_area_series(df0[ratio], self.area_source_unit_var.get(), self.area_target_unit_var.get())
+                    df0 = source_df.copy()
                     df0[val] = pd.to_numeric(df0[val], errors="coerce")
                     valid_count = int(df0[val].count())
                     if valid_count == 0:
                         skipped.append((val, group_fields))
                         continue
 
-                    area_col = self._get_area_column_name()
-                    if need_area:
+                    if need_area and ratio in df0.columns:
+                        df0[ratio] = convert_area_series(df0[ratio], self.area_source_unit, self.area_target_unit)
                         if group_fields:
                             area_total = df0.groupby(group_fields, dropna=False)[ratio].sum().reset_index(name=area_col)
                         else:
                             area_total = None
 
-                    df = build_grouped_stats_frame(df0, val, group_fields)
+                    df = build_grouped_stats_frame(df0, val, group_fields, self.plugin_stats)
 
-                    if need_area:
+                    if need_area and ratio in df0.columns:
                         if group_fields:
                             df = df.merge(area_total, on=group_fields, how="left")
-                            total_area = df[area_col].sum()
+                            total_area = pd.to_numeric(df[area_col], errors="coerce").sum()
                         else:
-                            total_area = float(df0[ratio].sum())
+                            total_area = float(pd.to_numeric(df0[ratio], errors="coerce").sum())
                             df[area_col] = total_area
-                        df["面积占比"] = (df[area_col] / total_area * 100) if total_area else np.nan
+                        df["面积占比"] = (pd.to_numeric(df[area_col], errors="coerce") / total_area * 100) if total_area else np.nan
 
-                    df = self._round_result_frame(df, group_fields, need_area)
+                    df = self._round_result_frame(df, group_fields, need_area, area_col)
                     df = apply_count_masks(df)
 
-                    # 排序
                     if group_fields:
                         for col in reversed(group_fields):
                             if col in self.custom_orders and self.custom_orders[col]:
                                 present = df[col].dropna().unique().tolist()
                                 seq = [v for v in self.custom_orders[col] if v in present]
-
                                 if seq:
-                                    if pd.api.types.is_numeric_dtype(df[col]):
-                                        try:
-                                            seq = [float(v) if isinstance(v, str) and v.replace('.', '',
-                                                                                                1).isdigit() else v for
-                                                   v in seq]
-                                        except:
-                                            pass
-
                                     df[col] = pd.Categorical(df[col], categories=seq, ordered=True)
                                     df = df.sort_values(by=col, kind="stable")
                                 else:
-                                    df = df.sort_values(
-                                        by=col,
-                                        key=lambda s: s.map(sort_key),
-                                        kind="stable"
-                                    )
+                                    df = df.sort_values(by=col, key=lambda s: s.map(sort_key), kind="stable")
                             else:
-                                df = df.sort_values(
-                                    by=col,
-                                    key=lambda s: s.map(sort_key),
-                                    kind="stable"
-                                )
+                                df = df.sort_values(by=col, key=lambda s: s.map(sort_key), kind="stable")
 
-                    if need_area:
-                        current_stats = stats + [area_col, "面积占比"]
-                    else:
-                        current_stats = stats.copy()
+                    current_stats = stats.copy()
+                    if need_area and ratio in df0.columns:
+                        current_stats += [area_col, "面积占比"]
 
-                    mlt = df.melt(
-                        id_vars=group_fields,
-                        value_vars=current_stats,
-                        var_name="指标",
-                        value_name="数值"
-                    )
-
-                    # 强制指标顺序
-                    order = {
-                        s: i for i, s in enumerate(
-                            stats + ([area_col, "面积占比"] if need_area else [])
-                        )
-                    }
+                    mlt = df.melt(id_vars=group_fields, value_vars=[s for s in current_stats if s in df.columns], var_name="指标", value_name="数值")
+                    order = {s: i for i, s in enumerate([s for s in current_stats if s in df.columns])}
                     mlt["__ord"] = mlt["指标"].map(order)
                     mlt.sort_values(group_fields + ["__ord"], inplace=True)
                     mlt.drop(columns="__ord", inplace=True)
 
-                    # 生成sheet名称
                     sheet_name = f"{val}"
                     if group_fields:
                         sheet_name += f"_{'_'.join(group_fields)}"
-                    sheet_name = sheet_name[:31]  # Excel sheet名称长度限制
-
-                    # 写入sheet
+                    sheet_name = sheet_name[:31]
                     mlt.to_excel(writer, index=False, sheet_name=sheet_name)
                     ws = writer.sheets[sheet_name]
                     overview_rows.append({
@@ -1500,57 +1015,31 @@ class VerticalApp:
                         "面积统计": "是" if need_area else "否",
                     })
 
-                    # 合并分类列
                     if group_fields:
                         start_row = 2
                         total_rows = len(mlt)
-
                         for ci in range(len(group_fields)):
                             prev = ws.cell(row=start_row, column=ci + 1).value
                             ms = start_row
-
                             for off in range(1, total_rows):
                                 r = start_row + off
                                 curr = ws.cell(row=r, column=ci + 1).value
-
                                 if curr != prev:
                                     if r - ms >= 2:
-                                        ws.merge_cells(
-                                            start_row=ms,
-                                            start_column=ci + 1,
-                                            end_row=r - 1,
-                                            end_column=ci + 1
-                                        )
+                                        ws.merge_cells(start_row=ms, start_column=ci + 1, end_row=r - 1, end_column=ci + 1)
                                     prev, ms = curr, r
-
                             last = start_row + total_rows - 1
                             if last - ms >= 1:
-                                ws.merge_cells(
-                                    start_row=ms,
-                                    start_column=ci + 1,
-                                    end_row=last,
-                                    end_column=ci + 1
-                                )
+                                ws.merge_cells(start_row=ms, start_column=ci + 1, end_row=last, end_column=ci + 1)
 
-                    # 设置居中 + 边框
                     thin = Side(border_style="thin", color="000000")
-                    border = Border(
-                        top=thin, bottom=thin,
-                        left=thin, right=thin
-                    )
-
-                    for row in ws.iter_rows(
-                            min_row=1,
-                            max_row=ws.max_row,
-                            min_col=1,
-                            max_col=ws.max_column
-                    ):
+                    border = Border(top=thin, bottom=thin, left=thin, right=thin)
+                    for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
                         for cell in row:
-                            cell.alignment = Alignment(
-                                horizontal="center",
-                                vertical="center"
-                            )
+                            cell.alignment = Alignment(horizontal="center", vertical="center")
                             cell.border = border
+                    if getattr(self, "export_charts", True):
+                        add_chart_sheet_from_frame(writer.book, sheet_name, df, group_fields, current_stats)
 
             self._write_export_overview(writer, out, overview_rows)
 
@@ -1734,7 +1223,6 @@ class VerticalApp:
         self.root.wait_window(dlg)
     def show_result_dialog(self, filepath, elapsed):
         mark_output(self, filepath)
-        self.save_config(show_msg=False)
         dlg = tk.Toplevel(self.root)
         dlg.title("完成")
         dlg.geometry("620x190")
@@ -1757,9 +1245,12 @@ class VerticalApp:
         ttk.Button(frm, text="复制路径",
                    command=lambda: copy_text(self, filepath, "导出路径已复制"))\
             .grid(row=0, column=3, padx=6)
+        ttk.Button(frm, text="发布包",
+                   command=lambda: publish_output_bundle(self, filepath))\
+            .grid(row=0, column=4, padx=6)
         ttk.Button(frm, text="关闭",
                    command=dlg.destroy)\
-            .grid(row=0, column=4, padx=6)
+            .grid(row=0, column=5, padx=6)
 
         dlg.grab_set()
 
@@ -1770,4 +1261,45 @@ class VerticalApp:
             messagebox.showerror("打开失败", str(e))
 
     def open_preview(self, filepath):
-        show_workbook_preview(self.root, filepath, title="预览结果", default_limit=300)
+        try:
+            xls = pd.read_excel(filepath, sheet_name=None)
+        except Exception as e:
+            return messagebox.showerror("预览失败", str(e))
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("预览结果")
+        dlg.geometry("800x500")
+
+        sheets = list(xls.keys())
+        var = tk.StringVar(value=sheets[0])
+        cmb = ttk.Combobox(dlg, values=sheets, textvariable=var,
+                           state="readonly")
+        cmb.pack(fill="x", padx=12, pady=(12,6))
+
+        container = ttk.Frame(dlg)
+        container.pack(fill="both", expand=True, padx=12, pady=(0,12))
+        tv = ttk.Treeview(container, show="headings")
+        vsb = ttk.Scrollbar(container, orient="vertical", command=tv.yview)
+        hsb = ttk.Scrollbar(container, orient="horizontal", command=tv.xview)
+        tv.configure(yscroll=vsb.set, xscroll=hsb.set)
+        tv.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
+
+        def load_sheet(e=None):
+            df = xls[var.get()]
+            tv.delete(*tv.get_children())
+            tv["columns"] = list(df.columns)
+            for col in df.columns:
+                tv.heading(col, text=col)
+                tv.column(col, width=100, anchor="center")
+
+            for row in df.itertuples(index=False):
+                tv.insert("", "end", values=row)
+
+        cmb.bind("<<ComboboxSelected>>", load_sheet)
+        load_sheet()
+
+        dlg.grab_set()

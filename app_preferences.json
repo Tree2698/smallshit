@@ -1,5 +1,5 @@
 {
-  "default_mode": "horizontal",
+  "default_mode": "vertical",
   "theme": "light",
   "reopen_last_file": false,
   "output_location": "source_dir",

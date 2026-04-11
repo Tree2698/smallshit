@@ -6,6 +6,12 @@ from tkinterdnd2 import TkinterDnD
 
 from ui_shell import DEFAULT_PREFERENCES, MODE_LABELS, load_app_preferences
 
+# 供 PyInstaller 静态分析使用，避免切换模式后遗漏模块
+if False:  # pragma: no cover
+    from app_horizontal import HorizontalApp as _HorizontalApp  # noqa: F401
+    from app_vertical import VerticalApp as _VerticalApp  # noqa: F401
+
+
 
 APP_OPTIONS = {
     "horizontal": "横版",
